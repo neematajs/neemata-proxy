@@ -40,7 +40,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            packages/proxy/target
+            ./target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: pnpm install
       - run: pnpm check
@@ -87,7 +87,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            packages/proxy/target
+            ./target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: pnpm install
       - run: pnpm run build
