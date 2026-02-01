@@ -43,7 +43,7 @@ jobs:
             ./target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: pnpm install
-      - run: pnpm check
+      - run: pnpm lint
 
   tests:
     needs: [lint]
@@ -90,6 +90,4 @@ jobs:
             ./target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: pnpm install
-      - run: pnpm run build
-      - run: pnpm run test:unit
-      - run: pnpm run test:integration
+      - run: pnpm run test
