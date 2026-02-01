@@ -112,7 +112,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.settings.target }}
-          path: "dist/*.node"
+          path: "*.node"
           if-no-files-found: error
 
   build-and-publish:
