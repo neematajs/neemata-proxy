@@ -152,7 +152,8 @@ jobs:
         run: |
           npm config set provenance true
           echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-          npm publish --access public
+          TAG=$(node scripts/tag.js "${{ inputs.version }}")
+          npm publish --access public --tag "$TAG"
       - name: Publish Github Release
         if: ${{ inputs.release }}
         uses: actions/github-script@v7
