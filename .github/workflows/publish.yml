@@ -146,7 +146,7 @@ jobs:
       - name: Move artifacts
         run: pnpm napi artifacts
       - name: Add dependency files
-        run: pnpm napi prepublish
+        run: pnpm napi prepublish --no-gh-release --tag-style npm
       - name: List packages
         run: ls -R ./npm
         shell: bash
