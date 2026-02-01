@@ -145,6 +145,8 @@ jobs:
         run: pnpm napi create-npm-dirs
       - name: Move artifacts
         run: pnpm napi artifacts
+      - name: Add dependency files
+        run: pnpm napi prepublish
       - name: List packages
         run: ls -R ./npm
         shell: bash
