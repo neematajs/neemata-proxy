@@ -5,7 +5,8 @@
   "scripts": {
     "fmt": "$npm_execpath biome check --diagnostic-level=error --write . && cargo fmt",
     "lint": "$npm_execpath biome lint --diagnostic-level=error . && cargo clippy",
-    "build:ci": "napi build --release",
+    "build:artifact": "napi build --release",
+    "build:js": "napi build --esm --js index.js --platform --output-dir ./dist",
     "build": "$npm_execpath build:debug --release",
     "build:debug": "napi build --esm --js index.js --platform --output-dir ./dist",
     "test": "cargo test && vitest run"
