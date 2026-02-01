@@ -34,15 +34,6 @@
     "vitest": "^4.0.18",
     "ws": "^8.18.3"
   },
-  "optionalDependencies": {
-    "@nmtjs/proxy-darwin-x64": "^1.0.0",
-    "@nmtjs/proxy-darwin-arm64": "^1.0.0",
-    "@nmtjs/proxy-linux-x64-gnu": "^1.0.0",
-    "@nmtjs/proxy-linux-x64-musl": "^1.0.0",
-    "@nmtjs/proxy-linux-arm64-gnu": "^1.0.0",
-    "@nmtjs/proxy-linux-arm64-musl": "^1.0.0",
-    "@nmtjs/proxy-linux-arm-gnueabihf": "^1.0.0"
-  },
   "files": [
     "dist",
     "LICENSE.md",
