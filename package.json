@@ -26,10 +26,8 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "dependencies": {
-    "@napi-rs/cli": "^3.4.1"
-  },
   "devDependencies": {
+    "@napi-rs/cli": "^3.4.1",
     "@biomejs/biome": "^2.3.13",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.1",
