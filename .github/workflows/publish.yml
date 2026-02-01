@@ -150,10 +150,13 @@ jobs:
         shell: bash
       - name: Publish
         run: |
-          npm config set provenance true
+          pnpm config set provenance true
           echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
           TAG=$(node scripts/tag.js "${{ inputs.version }}")
-          npm publish --access public --tag "$TAG"
+          pnpm publish --filter "." --dry-run --access public --no-git-checks --tag "$TAG"
+          pnpm publish --filter "./npm/*" --dry-run --access public --no-git-checks --tag "$TAG"
+          pnpm publish --filter "." --access public --no-git-checks --tag "$TAG"
+          pnpm publish --filter "./npm/*" --access public --no-git-checks --tag "$TAG"
       - name: Publish Github Release
         if: ${{ inputs.release }}
         uses: actions/github-script@v7
