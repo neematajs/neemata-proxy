@@ -2,9 +2,8 @@
   "name": "@nmtjs/proxy",
   "type": "module",
   "scripts": {
-    "postinstall": "$npm_execpath build",
-    "fmt": "cargo fmt",
-    "lint": "cargo clippy",
+    "fmt": "$npm_execpath biome check --diagnostic-level=error --write . && cargo fmt",
+    "lint": "$npm_execpath biome lint --diagnostic-level=error . && cargo clippy",
     "build": "$npm_execpath build:debug --release",
     "build:debug": "napi build --esm --js index.js --platform --output-dir ./dist",
     "test": "cargo test && vitest run"
@@ -13,21 +12,34 @@
     ".": "./dist/index.js"
   },
   "napi": {
-    "binaryName": "neemata-proxy"
+    "binaryName": "neemata-proxy",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-unknown-linux-musl",
+      "armv7-unknown-linux-gnueabihf"
+    ]
   },
   "dependencies": {
     "@napi-rs/cli": "^3.4.1"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.3.13",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.1",
+    "vitest": "^4.0.18",
     "ws": "^8.18.3"
   },
+  "optionalDependencies": {
+    "@cool/core-darwin-x64": "^1.0.0",
+    "@cool/core-win32-x64": "^1.0.0",
+    "@cool/core-linux-arm64": "^1.0.0"
+  },
   "files": [
-    "src",
-    "build.rs",
-    "Cargo.toml",
-    "Cargo.lock",
+    "dist",
     "LICENSE.md",
     "README.md"
   ]

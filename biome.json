@@ -1,0 +1,124 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": ["**"]
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on",
+          "options": {
+            "groups": [
+              {
+                "type": true,
+                "source": [":NODE:"]
+              },
+              {
+                "type": false,
+                "source": [":NODE:"]
+              },
+              ":BLANK_LINE:",
+              {
+                "type": true,
+                "source": [":PACKAGE:"]
+              },
+              {
+                "type": false,
+                "source": [":PACKAGE:"]
+              },
+              ":BLANK_LINE:",
+              {
+                "type": true,
+                "source": [":PATH:"]
+              },
+              {
+                "type": false,
+                "source": [":PATH:"]
+              },
+              ":BLANK_LINE:"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "style": {
+        "recommended": true,
+        "noNonNullAssertion": "off",
+        "noInferrableTypes": "off",
+        "useTemplate": "off",
+        "noUselessElse": "off",
+        "useDefaultParameterLast": "off",
+        "noParameterAssign": "off",
+        "noUnusedTemplateLiteral": "off",
+        "useLiteralEnumMembers": "error",
+        "useNodejsImportProtocol": "error",
+        "useAsConstAssertion": "error",
+        "useEnumInitializers": "error",
+        "useSelfClosingElements": "error",
+        "useConst": "error",
+        "useSingleVarDeclarator": "error",
+        "useNumberNamespace": "error",
+        "useExponentiationOperator": "error",
+        "useImportType": {
+          "level": "error",
+          "options": {
+            "style": "separatedType"
+          }
+        },
+        "useExportType": "error",
+        "useShorthandFunctionType": "error"
+      },
+      "complexity": {
+        "recommended": true,
+        "noBannedTypes": "off",
+        "noCommaOperator": "error",
+        "noArguments": "error",
+        "useArrowFunction": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "off",
+        "noAssignInExpressions": "off",
+        "useIterableCallbackReturn": "off"
+      },
+      "security": {
+        "recommended": true
+      },
+      "correctness": {
+        "noUnusedFunctionParameters": "off"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": true,
+    "formatWithErrors": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineEnding": "lf",
+    "lineWidth": 80
+  },
+  "javascript": {
+    "formatter": {
+      "enabled": true,
+      "arrowParentheses": "always",
+      "quoteStyle": "single",
+      "semicolons": "asNeeded",
+      "trailingCommas": "all",
+      "expand": "never"
+    }
+  },
+  "json": {
+    "formatter": {
+      "enabled": true
+    }
+  }
+}
