@@ -152,7 +152,7 @@ jobs:
         shell: bash
       - name: Build JS bindings
         run: pnpm build:js
-      - run: rm $(find ./dist -name *.node)
+      - run: rm $(find ./dist -name '*.node')
       - name: Publish
         run: |
           pnpm config set provenance true
