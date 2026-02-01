@@ -51,6 +51,23 @@ async function httpGet(
   })
 }
 
+function trackConnections(server: net.Server) {
+  const sockets = new Set<net.Socket>()
+
+  server.on('connection', (socket) => {
+    sockets.add(socket)
+    socket.on('close', () => {
+      sockets.delete(socket)
+    })
+  })
+
+  return () => {
+    for (const socket of sockets) {
+      socket.destroy()
+    }
+  }
+}
+
 async function expectRejectCode(fn: () => unknown, code: string) {
   let err: any
   try {
@@ -86,6 +103,49 @@ async function waitFor<T>(
   throw new Error(`timeout waiting for condition; last=${String(last)}`)
 }
 
+async function waitForWsFailure(
+  ws: WebSocket,
+  timeoutMs = 1000,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.terminate()
+      reject(new Error('timeout waiting for ws failure'))
+    }, timeoutMs)
+
+    ws.once('open', () => {
+      clearTimeout(timer)
+      reject(new Error('unexpected open'))
+    })
+    ws.once('error', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+    ws.once('close', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+async function closeWs(ws: WebSocket, timeoutMs = 1000): Promise<void> {
+  if (ws.readyState === WebSocket.CLOSED) return
+
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => resolve(), timeoutMs)
+    ws.once('close', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+    try {
+      ws.terminate()
+    } catch {
+      clearTimeout(timer)
+      resolve()
+    }
+  })
+}
+
 describe('Proxy wiring', () => {
   let upstreamHttp1Port = 0
   let upstreamHttp1AltPort = 0
@@ -107,13 +167,14 @@ describe('Proxy wiring', () => {
       res.setHeader('content-type', 'text/plain')
       res.end(`h1:${req.url ?? ''}`)
     })
+    const closeHttp1Sockets = trackConnections(http1)
     await new Promise<void>((resolve) =>
       http1.listen(upstreamHttp1Port, '127.0.0.1', resolve),
     )
-    toClose.push(
-      async () =>
-        await new Promise((resolve) => http1.close(() => resolve(undefined))),
-    )
+    toClose.push(async () => {
+      closeHttp1Sockets()
+      await new Promise((resolve) => http1.close(() => resolve(undefined)))
+    })
 
     // Second HTTP/1 upstream (used to verify routing/preference/dynamic update)
     upstreamHttp1AltPort = await getFreePort()
@@ -122,13 +183,14 @@ describe('Proxy wiring', () => {
       res.setHeader('content-type', 'text/plain')
       res.end(`h1b:${req.url ?? ''}`)
     })
+    const closeHttp1bSockets = trackConnections(http1b)
     await new Promise<void>((resolve) =>
       http1b.listen(upstreamHttp1AltPort, '127.0.0.1', resolve),
     )
-    toClose.push(
-      async () =>
-        await new Promise((resolve) => http1b.close(() => resolve(undefined))),
-    )
+    toClose.push(async () => {
+      closeHttp1bSockets()
+      await new Promise((resolve) => http1b.close(() => resolve(undefined)))
+    })
 
     // HTTP/2 (h2c) upstream
     upstreamHttp2Port = await getFreePort()
@@ -138,18 +200,20 @@ describe('Proxy wiring', () => {
       stream.respond({ ':status': 200, 'content-type': 'text/plain' })
       stream.end(`h2:${path}`)
     })
+    const closeH2Sockets = trackConnections(h2)
     await new Promise<void>((resolve) =>
       h2.listen(upstreamHttp2Port, '127.0.0.1', resolve),
     )
-    toClose.push(
-      async () =>
-        await new Promise((resolve) => h2.close(() => resolve(undefined))),
-    )
+    toClose.push(async () => {
+      closeH2Sockets()
+      await new Promise((resolve) => h2.close(() => resolve(undefined)))
+    })
 
     // WebSocket upstream
     upstreamWsPort = await getFreePort()
     const wsHttp = http.createServer()
     const wss = new WebSocketServer({ server: wsHttp })
+    const closeWsHttpSockets = trackConnections(wsHttp)
     wss.on('connection', (socket) => {
       socket.on('message', (msg) => {
         socket.send(`echo:${msg.toString()}`)
@@ -159,7 +223,11 @@ describe('Proxy wiring', () => {
       wsHttp.listen(upstreamWsPort, '127.0.0.1', resolve),
     )
     toClose.push(async () => {
+      for (const client of wss.clients) {
+        client.terminate()
+      }
       await new Promise<void>((resolve) => wss.close(() => resolve()))
+      closeWsHttpSockets()
       await new Promise<void>((resolve) => wsHttp.close(() => resolve()))
     })
   })
@@ -251,8 +319,7 @@ describe('Proxy wiring', () => {
     // At least one should succeed, others may succeed or get AlreadyStarted
     const successes = results.filter((r) => r.status === 'fulfilled')
     const failures = results.filter(
-      (r) =>
-        r.status === 'rejected' && (r.reason as any)?.code === 'AlreadyStarted',
+      (r) => r.status === 'rejected' && r.reason?.code === 'AlreadyStarted',
     )
 
     // All calls should either succeed or fail with AlreadyStarted (no crashes, no bind conflicts)
@@ -396,7 +463,7 @@ describe('Proxy wiring', () => {
           transport: 'http',
           secure: false,
           path: '/tmp/does-not-matter.sock',
-        } as any),
+        }),
       'UnsupportedUpstreamType',
     )
   })
@@ -537,7 +604,7 @@ describe('Proxy wiring', () => {
         ws.on('message', (data) => resolve(data.toString()))
         ws.on('error', reject)
       })
-      ws.close()
+      await closeWs(ws)
 
       expect(msg).toBe('echo:ping')
     } finally {
@@ -606,12 +673,8 @@ describe('Proxy wiring', () => {
     await proxy.start()
     try {
       const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-      await expect(
-        new Promise<void>((resolve, reject) => {
-          ws.on('open', () => reject(new Error('unexpected open')))
-          ws.on('error', () => resolve())
-        }),
-      ).resolves.toBeUndefined()
+      await expect(waitForWsFailure(ws)).resolves.toBeUndefined()
+      await closeWs(ws)
     } finally {
       await proxy.stop()
     }
@@ -853,16 +916,12 @@ describe('Proxy wiring', () => {
       })
       expect(msg2).toBe('echo:ping2')
 
-      ws.close()
+      await closeWs(ws)
 
       // New connections should fail (no upstreams)
       const ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-      await expect(
-        new Promise<void>((resolve, reject) => {
-          ws2.on('open', () => reject(new Error('unexpected open')))
-          ws2.on('error', () => resolve())
-        }),
-      ).resolves.toBeUndefined()
+      await expect(waitForWsFailure(ws2)).resolves.toBeUndefined()
+      await closeWs(ws2)
     } finally {
       await proxy.stop()
     }
