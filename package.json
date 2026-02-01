@@ -1,0 +1,34 @@
+{
+  "name": "@nmtjs/proxy",
+  "type": "module",
+  "scripts": {
+    "postinstall": "$npm_execpath build",
+    "fmt": "cargo fmt",
+    "lint": "cargo clippy",
+    "build": "$npm_execpath build:debug --release",
+    "build:debug": "napi build --esm --js index.js --platform --output-dir ./dist",
+    "test": "cargo test && vitest run"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "napi": {
+    "binaryName": "neemata-proxy"
+  },
+  "dependencies": {
+    "@napi-rs/cli": "^3.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "ws": "^8.18.3"
+  },
+  "files": [
+    "src",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE.md",
+    "README.md"
+  ]
+}
