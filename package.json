@@ -1,5 +1,6 @@
 {
   "name": "@nmtjs/proxy",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "fmt": "$npm_execpath biome check --diagnostic-level=error --write . && cargo fmt",
@@ -34,13 +35,18 @@
     "ws": "^8.18.3"
   },
   "optionalDependencies": {
-    "@cool/core-darwin-x64": "^1.0.0",
-    "@cool/core-win32-x64": "^1.0.0",
-    "@cool/core-linux-arm64": "^1.0.0"
+    "@nmtjs/proxy-darwin-x64": "^1.0.0",
+    "@nmtjs/proxy-darwin-arm64": "^1.0.0",
+    "@nmtjs/proxy-linux-x64-gnu": "^1.0.0",
+    "@nmtjs/proxy-linux-x64-musl": "^1.0.0",
+    "@nmtjs/proxy-linux-arm64-gnu": "^1.0.0",
+    "@nmtjs/proxy-linux-arm64-musl": "^1.0.0",
+    "@nmtjs/proxy-linux-arm-gnueabihf": "^1.0.0"
   },
   "files": [
     "dist",
     "LICENSE.md",
     "README.md"
-  ]
+  ],
+  "packageManager": "pnpm@10.28.2+sha512.41872f037ad22f7348e3b1debbaf7e867cfd448f2726d9cf74c08f19507c31d2c8e7a11525b983febc2df640b5438dee6023ebb1f84ed43cc2d654d2bc326264"
 }
