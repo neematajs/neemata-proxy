@@ -9,10 +9,10 @@ importers:
   .:
     devDependencies:
       '@biomejs/biome':
-        specifier: ^2.3.13
+        specifier: 2.3.13
         version: 2.3.13
       '@napi-rs/cli':
-        specifier: ^3.4.1
+        specifier: 3.5.1
         version: 3.5.1(@emnapi/runtime@1.8.1)(@types/node@24.10.9)
       '@types/node':
         specifier: ^24.0.0
@@ -21,7 +21,7 @@ importers:
         specifier: ^8.18.1
         version: 8.18.1
       vitest:
-        specifier: ^4.0.18
+        specifier: 4.0.18
         version: 4.0.18(@types/node@24.10.9)
       ws:
         specifier: ^8.18.3
