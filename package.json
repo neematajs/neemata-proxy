@@ -1,6 +1,7 @@
 {
   "name": "@nmtjs/proxy",
   "version": "1.0.0",
+  "type": "commonjs",
   "publishConfig": {
     "main": "dist/index.js",
     "types": "dist/index.d.ts"
@@ -14,7 +15,6 @@
     "build:debug": "napi build --js index.js --platform --output-dir ./dist",
     "test": "cargo test && vitest run"
   },
-
   "napi": {
     "binaryName": "neemata-proxy",
     "targets": [
