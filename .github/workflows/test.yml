@@ -42,8 +42,11 @@ jobs:
             ~/.cargo/git
             ./target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Patch crate
+        run: |
+          cargo install patch-crate
+          cargo patch-crate
       - run: pnpm install
-      - run: cargo patch-crate
       - run: pnpm lint
 
   tests:
@@ -90,7 +93,10 @@ jobs:
             ~/.cargo/git
             ./target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Patch crate
+        run: |
+          cargo install patch-crate
+          cargo patch-crate
       - run: pnpm install
-      - run: cargo patch-crate
       - run: pnpm run build
       - run: pnpm run test

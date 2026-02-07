@@ -103,8 +103,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           tool: cargo-zigbuild
+      - name: Patch crate
+        run: |
+          cargo install patch-crate
+          cargo patch-crate
       - name: Install dependencies
-        run: pnpm install && cargo patch-crate
+        run: pnpm install
       - name: Build
         run: ${{ matrix.settings.build }}
         shell: bash

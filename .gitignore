@@ -1,7 +1,3 @@
-# these two are cloned repos used for agents to easier look for actual implementations
-/pingora
-/napi-rs
-
 # Created by https://www.toptal.com/developers/gitignore/api/node
 # Edit at https://www.toptal.com/developers/gitignore?templates=node
 
