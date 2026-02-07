@@ -72,6 +72,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y zlib1g-dev
+      - name: Configure zlib paths (x86_64-unknown-linux-gnu)
+        if: ${{ matrix.settings.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          echo "ZLIB_LIB_DIR=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "ZLIB_INCLUDE_DIR=/usr/include" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
