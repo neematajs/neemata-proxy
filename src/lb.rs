@@ -12,6 +12,7 @@ use crate::server::ServiceHandle;
 pub enum TransportKind {
     Http1,
     Http2,
+    Ws,
 }
 
 #[allow(dead_code)]

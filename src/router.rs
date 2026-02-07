@@ -24,6 +24,7 @@ pub struct RouterConfig {
 #[derive(Clone)]
 pub struct AppPools {
     pub http1: Option<PoolConfig>,
+    pub ws: Option<PoolConfig>,
     pub http2: Option<PoolConfig>,
 }
 
@@ -140,7 +141,7 @@ impl ProxyHttp for SharedRouter {
             && let Some(pools) = config.apps.get(app_name)
         {
             let (pool, is_http2) = if is_upgrade {
-                (pools.http1.as_ref(), false)
+                (pools.ws.as_ref(), false)
             } else if let Some(p) = pools.http2.as_ref() {
                 (Some(p), true)
             } else {
@@ -162,7 +163,7 @@ impl ProxyHttp for SharedRouter {
         if ctx.is_upgrade
             && let Some(app_name) = ctx.app_name.as_deref()
             && let Some(pools) = config.apps.get(app_name)
-            && pools.http1.is_none()
+            && pools.ws.is_none()
         {
             let mut resp = ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, Some(2))?;
             let _ = resp.insert_header(header::CONTENT_LENGTH, 0);

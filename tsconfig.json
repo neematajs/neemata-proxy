@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowJs": false,
+    "noEmit": true,
+    "rewriteRelativeImportExtensions": true,
+    "allowImportingTsExtensions": true,
+
+    "noImplicitAny": false,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noPropertyAccessFromIndexSignature": false,
+
+    "tsBuildInfoFile": "${configDir}/node_modules/.tmp/.tsbuildinfo"
+  },
+  "include": ["./test/**/*.ts", "./vitest.config.ts"],
+  "exclude": [
+    "**/dist/**",
+    "**/coverage/**",
+    "**/node_modules/**",
+    "**/target/**"
+  ]
+}

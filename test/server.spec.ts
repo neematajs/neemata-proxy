@@ -590,7 +590,7 @@ describe('Proxy wiring', () => {
 
     await proxy.addUpstream('app', {
       type: 'port',
-      transport: 'http',
+      transport: 'ws',
       secure: false,
       hostname: '127.0.0.1',
       port: upstreamWsPort,
@@ -609,6 +609,111 @@ describe('Proxy wiring', () => {
       expect(msg).toBe('echo:ping')
     } finally {
       await proxy.stop()
+    }
+  })
+
+  it('supports http, http2, and ws on the same app', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'ws',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamWsPort,
+    })
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http2',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp2Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/hello')
+      expect(res.status).toBe(200)
+      expect(res.body).toBe('h2:/hello')
+
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      const msg = await new Promise<string>((resolve, reject) => {
+        ws.on('open', () => ws.send('ping'))
+        ws.on('message', (data) => resolve(data.toString()))
+        ws.on('error', reject)
+      })
+      await closeWs(ws)
+
+      expect(msg).toBe('echo:ping')
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('routes ws upgrades only to ws pool', async () => {
+    const nonWsPort = await getFreePort()
+    const nonWsUpgradeSpy = vi.fn()
+    const nonWsServer = http.createServer((req, res) => {
+      res.statusCode = 200
+      res.setHeader('content-type', 'text/plain')
+      res.end('ok')
+    })
+    nonWsServer.on('upgrade', (_req, socket) => {
+      nonWsUpgradeSpy()
+      socket.destroy()
+    })
+    const closeNonWsSockets = trackConnections(nonWsServer)
+    await new Promise<void>((resolve) =>
+      nonWsServer.listen(nonWsPort, '127.0.0.1', resolve),
+    )
+
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'ws',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamWsPort,
+    })
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: nonWsPort,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/hello')
+      expect(res.status).toBe(200)
+      expect(res.body).toBe('ok')
+
+      for (let i = 0; i < 6; i++) {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+        const msg = await new Promise<string>((resolve, reject) => {
+          ws.on('open', () => ws.send('ping'))
+          ws.on('message', (data) => resolve(data.toString()))
+          ws.on('error', reject)
+        })
+        await closeWs(ws)
+        expect(msg).toBe('echo:ping')
+      }
+
+      expect(nonWsUpgradeSpy).not.toHaveBeenCalled()
+    } finally {
+      await proxy.stop()
+      closeNonWsSockets()
+      await new Promise<void>((resolve) => nonWsServer.close(() => resolve()))
     }
   })
 
@@ -880,7 +985,7 @@ describe('Proxy wiring', () => {
 
     const u = {
       type: 'port',
-      transport: 'http',
+      transport: 'ws',
       secure: false,
       hostname: '127.0.0.1',
       port: upstreamWsPort,

@@ -485,11 +485,16 @@ fn build_router_config(
         let http1 = pools
             .get(&(app.name.clone(), lb::TransportKind::Http1))
             .cloned();
+        let ws = pools.get(&(app.name.clone(), lb::TransportKind::Ws)).cloned();
         let http2 = pools
             .get(&(app.name.clone(), lb::TransportKind::Http2))
             .cloned();
         cfg.apps
-            .insert(app.name.clone(), router::AppPools { http1, http2 });
+            .insert(app.name.clone(), router::AppPools {
+                http1,
+                ws,
+                http2,
+            });
     }
 
     cfg
@@ -499,6 +504,7 @@ fn lb_service_name(app: &str, transport: lb::TransportKind) -> String {
     match transport {
         lb::TransportKind::Http1 => format!("lb:{app}:http"),
         lb::TransportKind::Http2 => format!("lb:{app}:http2"),
+        lb::TransportKind::Ws => format!("lb:{app}:ws"),
     }
 }
 
@@ -516,6 +522,7 @@ fn parse_port_upstream(env: &Env, upstream: UpstreamOptions) -> Result<PortUpstr
             let transport = match port.transport.as_str() {
                 "http" => lb::TransportKind::Http1,
                 "http2" => lb::TransportKind::Http2,
+                "ws" => lb::TransportKind::Ws,
                 other => {
                     return errors::throw_type_error(
                         env,
@@ -677,7 +684,11 @@ fn rebuild_app_pools(
     }
 
     let mut removed = Vec::new();
-    for t in [lb::TransportKind::Http1, lb::TransportKind::Http2] {
+    for t in [
+        lb::TransportKind::Http1,
+        lb::TransportKind::Http2,
+        lb::TransportKind::Ws,
+    ] {
         if !new_pools.contains_key(&t) {
             removed.push(t);
         }
