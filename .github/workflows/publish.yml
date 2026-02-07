@@ -104,7 +104,7 @@ jobs:
         with:
           tool: cargo-zigbuild
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install && cargo patch-crate
       - name: Build
         run: ${{ matrix.settings.build }}
         shell: bash
