@@ -1,0 +1,12 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index ef4515c..7ec984b 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -578,7 +578,6 @@ impl Server {
+                 info!("Waiting for runtimes to exit!");
+                 let join = thread::spawn(move || {
+                     rt.shutdown_timeout(shutdown_timeout);
+-                    thread::sleep(shutdown_timeout)
+                 });
+                 (join, name)
+             })
