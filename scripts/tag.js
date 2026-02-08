@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { parseArgs } = require('node:util/util')
+const { parseArgs } = require('node:util')
 const { positionals } = parseArgs({ allowPositionals: true })
 const [version] = positionals
 let tag = 'latest'
