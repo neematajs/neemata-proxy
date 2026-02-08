@@ -136,6 +136,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          registry-url: "https://registry.npmjs.org"
           cache: pnpm
       - name: Patch crate
         run: |
@@ -163,7 +164,6 @@ jobs:
       - run: rm $(find ./dist -name '*.node')
       - name: Publish
         run: |
-          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
           TAG=$(node scripts/tag.js "${{ inputs.version }}")
           pnpm publish --filter "." --dry-run --access public --no-git-checks --tag "$TAG"
           pnpm publish --filter "./npm/*" --dry-run --access public --no-git-checks --tag "$TAG"
