@@ -56,6 +56,7 @@ pub struct UnixSocketUpstreamOptions {
     pub path: String,
 }
 
+#[napi]
 pub type UpstreamOptions = Either<PortUpstreamOptions, UnixSocketUpstreamOptions>;
 
 #[napi]
