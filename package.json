@@ -2,9 +2,12 @@
   "name": "@nmtjs/proxy",
   "version": "1.0.0",
   "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "repository": {
+    "url": "https://github.com/neematajs/neemata-proxy"
+  },
   "publishConfig": {
-    "main": "dist/index.js",
-    "types": "dist/index.d.ts",
     "provenance": true
   },
   "scripts": {
