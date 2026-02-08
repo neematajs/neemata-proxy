@@ -137,6 +137,10 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - name: Patch crate
+        run: |
+          cargo install patch-crate
+          cargo patch-crate
       - name: Install dependencies
         run: pnpm install
       - name: Set version
