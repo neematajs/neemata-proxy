@@ -163,7 +163,6 @@ jobs:
       - run: rm $(find ./dist -name '*.node')
       - name: Publish
         run: |
-          pnpm config set provenance true
           echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
           TAG=$(node scripts/tag.js "${{ inputs.version }}")
           pnpm publish --filter "." --dry-run --access public --no-git-checks --tag "$TAG"
