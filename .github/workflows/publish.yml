@@ -163,7 +163,7 @@ jobs:
       - run: rm $(find ./dist -name '*.node')
       - name: Publish
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
+          pnpm config set -g "//registry.npmjs.org/:_authToken=${NPM_TOKEN}"
           TAG=$(node scripts/tag.js "${{ inputs.version }}")
           pnpm access list packages nmtjs
           pnpm config set provenance true
