@@ -1,5 +1,6 @@
 {
   "name": "@nmtjs/proxy",
+  "description": "Rust-based reverse proxy for Neemata, exposed via NAPI.",
   "version": "1.0.0",
   "type": "commonjs",
   "main": "dist/index.js",
