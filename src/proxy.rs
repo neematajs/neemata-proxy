@@ -41,7 +41,9 @@ struct PortUpstream {
 
 #[napi(object)]
 pub struct PortUpstreamOptions {
+    #[napi(ts_type = " 'port' ")]
     pub r#type: String,
+    #[napi(ts_type = " 'http' | 'http2' | 'ws' ")]
     pub transport: String,
     pub secure: bool,
     pub hostname: String,
@@ -50,7 +52,9 @@ pub struct PortUpstreamOptions {
 
 #[napi(object)]
 pub struct UnixSocketUpstreamOptions {
+    #[napi(ts_type = " 'unix' ")]
     pub r#type: String,
+    #[napi(ts_type = " 'http' | 'http2' | 'ws' ")]
     pub transport: String,
     pub secure: bool,
     pub path: String,
@@ -486,16 +490,14 @@ fn build_router_config(
         let http1 = pools
             .get(&(app.name.clone(), lb::TransportKind::Http1))
             .cloned();
-        let ws = pools.get(&(app.name.clone(), lb::TransportKind::Ws)).cloned();
+        let ws = pools
+            .get(&(app.name.clone(), lb::TransportKind::Ws))
+            .cloned();
         let http2 = pools
             .get(&(app.name.clone(), lb::TransportKind::Http2))
             .cloned();
         cfg.apps
-            .insert(app.name.clone(), router::AppPools {
-                http1,
-                ws,
-                http2,
-            });
+            .insert(app.name.clone(), router::AppPools { http1, ws, http2 });
     }
 
     cfg
