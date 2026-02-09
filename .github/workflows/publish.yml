@@ -49,19 +49,19 @@ jobs:
           - host: macos-latest
             target: aarch64-apple-darwin
             build: pnpm build:artifact --platform --target aarch64-apple-darwin
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
             build: pnpm build:artifact --platform --target x86_64-unknown-linux-gnu
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: x86_64-unknown-linux-musl
             build: pnpm build:artifact --platform --target x86_64-unknown-linux-musl -x
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: aarch64-unknown-linux-gnu
             build: pnpm build:artifact --platform --target aarch64-unknown-linux-gnu --use-napi-cross
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: aarch64-unknown-linux-musl
             build: pnpm build:artifact --platform --target aarch64-unknown-linux-musl -x
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: armv7-unknown-linux-gnueabihf
             build: pnpm build:artifact --platform --target armv7-unknown-linux-gnueabihf --use-napi-cross
     steps:
@@ -85,13 +85,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
+            ~/.cargo/registry
+            ~/.cargo/git
             ~/.napi-rs
             .cargo-cache
             target/
-          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}
+          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('**/Cargo.lock') }}
       - uses: mlugg/setup-zig@v2
         if: ${{ contains(matrix.settings.target, 'musl') }}
         with:
@@ -121,23 +120,35 @@ jobs:
 
   build-and-publish:
     needs: [build]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       version_tag: v${{ inputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          run_install: false
       - name: Use Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
           cache: pnpm
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Setup cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ./target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Patch crate
         run: |
           cargo install patch-crate
