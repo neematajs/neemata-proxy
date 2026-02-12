@@ -9,6 +9,22 @@ pub struct ProxyOptions {
     pub applications: Vec<ApplicationOptions>,
     /// Health check interval in milliseconds. Defaults to 5000ms (5 seconds).
     pub health_check_interval_ms: Option<u32>,
+    /// Sticky session configuration.
+    pub sticky_sessions: Option<StickySessionOptions>,
+}
+
+#[napi(object)]
+pub struct StickySessionOptions {
+    /// Whether sticky sessions are enabled.
+    pub enabled: Option<bool>,
+    /// Cookie name used to persist affinity key (default: "nmt_affinity").
+    pub cookie_name: Option<String>,
+    /// Header name used for custom affinity key (default: "x-nmt-affinity-key").
+    pub header_name: Option<String>,
+    /// Sliding expiration TTL in milliseconds (default: 600000 = 10 minutes).
+    pub ttl_ms: Option<u32>,
+    /// Maximum affinity entries kept in memory (default: 20000).
+    pub max_entries: Option<u32>,
 }
 
 #[napi(object)]
@@ -40,6 +56,16 @@ pub struct ProxyOptionsParsed {
     pub applications: Vec<ApplicationOptionsParsed>,
     /// Health check interval in milliseconds.
     pub health_check_interval_ms: u32,
+    pub sticky_sessions: StickySessionOptionsParsed,
+}
+
+#[derive(Debug, Clone)]
+pub struct StickySessionOptionsParsed {
+    pub enabled: bool,
+    pub cookie_name: String,
+    pub header_name: String,
+    pub ttl_ms: u32,
+    pub max_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -79,11 +105,79 @@ pub fn parse_proxy_options(env: &Env, options: ProxyOptions) -> Result<ProxyOpti
 
     validate_applications(env, &applications)?;
 
+    let sticky_sessions = parse_sticky_session_options(env, options.sticky_sessions)?;
+
     Ok(ProxyOptionsParsed {
         listen,
         tls,
         applications,
         health_check_interval_ms: options.health_check_interval_ms.unwrap_or(5000),
+        sticky_sessions,
+    })
+}
+
+fn parse_sticky_session_options(
+    env: &Env,
+    sticky: Option<StickySessionOptions>,
+) -> Result<StickySessionOptionsParsed> {
+    let Some(sticky) = sticky else {
+        return Ok(StickySessionOptionsParsed {
+            enabled: false,
+            cookie_name: "nmt_affinity".to_string(),
+            header_name: "x-nmt-affinity-key".to_string(),
+            ttl_ms: 600_000,
+            max_entries: 20_000,
+        });
+    };
+
+    let enabled = sticky.enabled.unwrap_or(true);
+    let cookie_name = sticky
+        .cookie_name
+        .unwrap_or_else(|| "nmt_affinity".to_string());
+    let header_name = sticky
+        .header_name
+        .unwrap_or_else(|| "x-nmt-affinity-key".to_string());
+    let ttl_ms = sticky.ttl_ms.unwrap_or(600_000);
+    let max_entries = sticky.max_entries.unwrap_or(20_000);
+
+    if cookie_name.trim().is_empty() {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_PROXY_OPTIONS,
+            "stickySessions.cookieName must be non-empty",
+        );
+    }
+
+    if header_name.trim().is_empty() {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_PROXY_OPTIONS,
+            "stickySessions.headerName must be non-empty",
+        );
+    }
+
+    if ttl_ms == 0 {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_PROXY_OPTIONS,
+            "stickySessions.ttlMs must be greater than 0",
+        );
+    }
+
+    if max_entries == 0 {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_PROXY_OPTIONS,
+            "stickySessions.maxEntries must be greater than 0",
+        );
+    }
+
+    Ok(StickySessionOptionsParsed {
+        enabled,
+        cookie_name,
+        header_name,
+        ttl_ms,
+        max_entries: max_entries as usize,
     })
 }
 

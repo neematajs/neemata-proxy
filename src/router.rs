@@ -1,6 +1,12 @@
+use crate::lb;
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use http::header;
@@ -33,6 +39,7 @@ pub struct PoolConfig {
     pub lb: Arc<LoadBalancer<RoundRobin>>,
     pub secure: bool,
     pub verify_hostname: String,
+    pub backends: Arc<HashSet<String>>,
 }
 
 /// Pre-resolved pool information cached in context to avoid repeated lookups.
@@ -42,18 +49,103 @@ pub struct ResolvedPool {
     pub secure: bool,
     pub verify_hostname: String,
     pub is_http2: bool,
+    pub transport: lb::TransportKind,
+    pub backends: Arc<HashSet<String>>,
 }
+
+#[derive(Clone)]
+pub struct StickySessionConfig {
+    pub enabled: bool,
+    pub cookie_name: String,
+    pub header_name: String,
+    pub ttl: Duration,
+    pub max_entries: usize,
+    pub cookie_secure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AffinityMapKey {
+    app_name: String,
+    transport: lb::TransportKind,
+    affinity_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct AffinityEntry {
+    backend: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvictionItem {
+    expires_at: Instant,
+    sequence: u64,
+    shard_index: usize,
+    key: AffinityMapKey,
+}
+
+impl PartialOrd for EvictionItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EvictionItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.expires_at
+            .cmp(&other.expires_at)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+struct StickyShard {
+    entries: Mutex<HashMap<AffinityMapKey, AffinityEntry>>,
+    op_counter: AtomicU64,
+}
+
+struct StickySessionState {
+    config: StickySessionConfig,
+    shards: Vec<StickyShard>,
+    eviction_index: Mutex<BinaryHeap<Reverse<EvictionItem>>>,
+    key_counter: AtomicU64,
+    eviction_counter: AtomicU64,
+}
+
+const STICKY_SHARD_COUNT: usize = 64;
+const MAX_AFFINITY_KEY_LEN: usize = 256;
 
 #[allow(dead_code)]
 pub struct Router {
     config: ArcSwap<RouterConfig>,
+    sticky: Option<Arc<StickySessionState>>,
 }
 
 impl Router {
     #[allow(dead_code)]
-    pub fn new(config: RouterConfig) -> Self {
+    pub fn new(config: RouterConfig, sticky_config: StickySessionConfig) -> Self {
+        let sticky = if sticky_config.enabled {
+            let mut shards = Vec::with_capacity(STICKY_SHARD_COUNT);
+            for _ in 0..STICKY_SHARD_COUNT {
+                shards.push(StickyShard {
+                    entries: Mutex::new(HashMap::new()),
+                    op_counter: AtomicU64::new(0),
+                });
+            }
+
+            Some(Arc::new(StickySessionState {
+                config: sticky_config,
+                shards,
+                eviction_index: Mutex::new(BinaryHeap::new()),
+                key_counter: AtomicU64::new(1),
+                eviction_counter: AtomicU64::new(1),
+            }))
+        } else {
+            None
+        };
+
         Self {
             config: ArcSwap::from_pointee(config),
+            sticky,
         }
     }
 
@@ -73,6 +165,10 @@ pub struct RouterCtx {
     pub is_upgrade: bool,
     /// Cached pool resolution from request_filter to avoid re-lookup in upstream_peer.
     pub resolved_pool: Option<ResolvedPool>,
+    pub selected_transport: Option<lb::TransportKind>,
+    pub affinity_key: Option<String>,
+    pub should_set_cookie: bool,
+    pub sticky_retry_attempted: bool,
 }
 
 impl SharedRouter {
@@ -111,7 +207,7 @@ impl ProxyHttp for SharedRouter {
 
         let host = extract_host(session);
         let path_first_segment = extract_first_path_segment(session);
-        let is_upgrade = is_upgrade_request(session);
+        let is_upgrade = session.is_upgrade_req();
 
         let mut app_name: Option<String> = None;
         let mut rewrite_segment: Option<String> = None;
@@ -154,8 +250,37 @@ impl ProxyHttp for SharedRouter {
                     secure: pool.secure,
                     verify_hostname: pool.verify_hostname.clone(),
                     is_http2,
+                    transport: if is_upgrade {
+                        lb::TransportKind::Ws
+                    } else if is_http2 {
+                        lb::TransportKind::Http2
+                    } else {
+                        lb::TransportKind::Http1
+                    },
+                    backends: Arc::clone(&pool.backends),
                 });
             }
+        }
+
+        if let (Some(sticky), Some(_app_name), Some(_resolved)) = (
+            self.0.sticky.as_ref(),
+            ctx.app_name.as_ref(),
+            ctx.resolved_pool.as_ref(),
+        ) {
+            let cookie_key = extract_cookie_value(session, &sticky.config.cookie_name);
+            let header_key = extract_header_value(session, &sticky.config.header_name);
+
+            let affinity_key = if let Some(key) = cookie_key {
+                key
+            } else if let Some(key) = header_key {
+                key
+            } else {
+                sticky.generate_affinity_key()
+            };
+
+            ctx.affinity_key = Some(affinity_key);
+            // Always refresh cookie for sliding expiration.
+            ctx.should_set_cookie = true;
         }
 
         // Deterministic behavior: Upgrade/WebSocket must go to an HTTP/1 pool.
@@ -169,6 +294,10 @@ impl ProxyHttp for SharedRouter {
             let _ = resp.insert_header(header::CONTENT_LENGTH, 0);
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
+        }
+
+        if let Some(resolved) = ctx.resolved_pool.as_ref() {
+            ctx.selected_transport = Some(resolved.transport);
         }
 
         Ok(false)
@@ -188,15 +317,42 @@ impl ProxyHttp for SharedRouter {
             ));
         };
 
-        let Some(backend) = resolved.lb.select(b"", 8) else {
-            return Err(Error::explain(
-                ErrorType::InternalError,
-                "no healthy upstreams available",
-            ));
+        let selected_addr = if let (Some(sticky), Some(app_name), Some(affinity_key)) = (
+            self.0.sticky.as_ref(),
+            ctx.app_name.as_deref(),
+            ctx.affinity_key.as_deref(),
+        ) {
+            if let Some(mapped) = sticky.lookup(
+                app_name,
+                resolved.transport,
+                affinity_key,
+                &resolved.backends,
+            ) {
+                mapped
+            } else {
+                let Some(backend) = resolved.lb.select(affinity_key.as_bytes(), 8) else {
+                    return Err(Error::explain(
+                        ErrorType::InternalError,
+                        "no healthy upstreams available",
+                    ));
+                };
+
+                let selected = backend.addr.to_string();
+                sticky.bind(app_name, resolved.transport, affinity_key, selected.clone());
+                selected
+            }
+        } else {
+            let Some(backend) = resolved.lb.select(b"", 8) else {
+                return Err(Error::explain(
+                    ErrorType::InternalError,
+                    "no healthy upstreams available",
+                ));
+            };
+            backend.addr.to_string()
         };
 
         let mut peer = HttpPeer::new(
-            backend.addr.clone(),
+            selected_addr.as_str(),
             resolved.secure,
             resolved.verify_hostname.clone(),
         );
@@ -209,6 +365,61 @@ impl ProxyHttp for SharedRouter {
         }
 
         Ok(Box::new(peer))
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let (Some(sticky), Some(affinity_key)) =
+            (self.0.sticky.as_ref(), ctx.affinity_key.as_deref())
+        else {
+            return Ok(());
+        };
+
+        if !ctx.should_set_cookie {
+            return Ok(());
+        }
+
+        upstream_response
+            .append_header(header::SET_COOKIE, sticky.cookie_header_value(affinity_key))
+            .map_err(|e| {
+                Error::because(
+                    ErrorType::InternalError,
+                    "failed to append sticky session cookie",
+                    e,
+                )
+            })?;
+
+        Ok(())
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        let (Some(sticky), Some(app_name), Some(transport), Some(affinity_key)) = (
+            self.0.sticky.as_ref(),
+            ctx.app_name.as_deref(),
+            ctx.selected_transport,
+            ctx.affinity_key.as_deref(),
+        ) else {
+            return e;
+        };
+
+        sticky.remove(app_name, transport, affinity_key);
+
+        if !ctx.sticky_retry_attempted {
+            ctx.sticky_retry_attempted = true;
+            e.set_retry(true);
+        }
+
+        e
     }
 
     async fn upstream_request_filter(
@@ -246,10 +457,230 @@ impl ProxyHttp for SharedRouter {
     }
 }
 
-fn is_upgrade_request(session: &Session) -> bool {
-    // WebSocket/Upgrade is an HTTP/1.1 mechanism.
-    // Keep it simple: treat presence of `Upgrade` header as an upgrade request.
-    session.req_header().headers.get(header::UPGRADE).is_some()
+impl StickySessionState {
+    fn lookup(
+        &self,
+        app_name: &str,
+        transport: lb::TransportKind,
+        affinity_key: &str,
+        allowed_backends: &HashSet<String>,
+    ) -> Option<String> {
+        let now = Instant::now();
+        let key = AffinityMapKey {
+            app_name: app_name.to_string(),
+            transport,
+            affinity_key: affinity_key.to_string(),
+        };
+
+        let shard_index = self.shard_index_for_key(&key);
+        let shard = &self.shards[shard_index];
+        if self.should_cleanup(shard) {
+            self.cleanup_global(now);
+        }
+
+        let mut entries = shard.entries.lock().ok()?;
+
+        match entries.get_mut(&key) {
+            Some(entry) if entry.expires_at > now && allowed_backends.contains(&entry.backend) => {
+                entry.expires_at = now + self.config.ttl;
+                self.record_eviction_candidate(shard_index, &key, entry.expires_at);
+                Some(entry.backend.clone())
+            }
+            Some(_) => {
+                entries.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn bind(
+        &self,
+        app_name: &str,
+        transport: lb::TransportKind,
+        affinity_key: &str,
+        backend: String,
+    ) {
+        let key = AffinityMapKey {
+            app_name: app_name.to_string(),
+            transport,
+            affinity_key: affinity_key.to_string(),
+        };
+        let now = Instant::now();
+        let shard_index = self.shard_index_for_key(&key);
+        let shard = &self.shards[shard_index];
+        let expires_at = now + self.config.ttl;
+
+        let Ok(mut entries) = shard.entries.lock() else {
+            return;
+        };
+
+        entries.insert(
+            key,
+            AffinityEntry {
+                backend,
+                expires_at,
+            },
+        );
+
+        self.record_eviction_candidate(
+            shard_index,
+            &AffinityMapKey {
+                app_name: app_name.to_string(),
+                transport,
+                affinity_key: affinity_key.to_string(),
+            },
+            expires_at,
+        );
+
+        if !self.should_cleanup(shard) {
+            return;
+        }
+
+        drop(entries);
+
+        self.cleanup_global(now);
+    }
+
+    fn remove(&self, app_name: &str, transport: lb::TransportKind, affinity_key: &str) {
+        let key = AffinityMapKey {
+            app_name: app_name.to_string(),
+            transport,
+            affinity_key: affinity_key.to_string(),
+        };
+        let shard_index = self.shard_index_for_key(&key);
+        let shard = &self.shards[shard_index];
+
+        let Ok(mut entries) = shard.entries.lock() else {
+            return;
+        };
+        entries.remove(&key);
+    }
+
+    fn generate_affinity_key(&self) -> String {
+        let tick = self.key_counter.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{:x}{:x}", now, tick)
+    }
+
+    fn cookie_header_value(&self, affinity_key: &str) -> String {
+        let max_age_seconds = (self.config.ttl.as_secs().max(1)).to_string();
+
+        if self.config.cookie_secure {
+            format!(
+                "{}={}; Max-Age={}; Path=/; HttpOnly; SameSite=Lax; Secure",
+                self.config.cookie_name, affinity_key, max_age_seconds
+            )
+        } else {
+            format!(
+                "{}={}; Max-Age={}; Path=/; HttpOnly; SameSite=Lax",
+                self.config.cookie_name, affinity_key, max_age_seconds
+            )
+        }
+    }
+
+    fn shard_index_for_key(&self, key: &AffinityMapKey) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn record_eviction_candidate(
+        &self,
+        shard_index: usize,
+        key: &AffinityMapKey,
+        expires_at: Instant,
+    ) {
+        let Ok(mut heap) = self.eviction_index.lock() else {
+            return;
+        };
+
+        heap.push(Reverse(EvictionItem {
+            expires_at,
+            sequence: self.eviction_counter.fetch_add(1, Ordering::Relaxed),
+            shard_index,
+            key: key.clone(),
+        }));
+    }
+
+    fn should_cleanup(&self, shard: &StickyShard) -> bool {
+        shard
+            .op_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(128)
+    }
+
+    fn cleanup_global(&self, now: Instant) {
+        let mut shard_guards = self
+            .shards
+            .iter()
+            .filter_map(|shard| shard.entries.lock().ok())
+            .collect::<Vec<_>>();
+
+        for entries in &mut shard_guards {
+            entries.retain(|_, entry| entry.expires_at > now);
+        }
+
+        let current_entries = shard_guards
+            .iter()
+            .map(|entries| entries.len())
+            .sum::<usize>();
+
+        if current_entries <= self.config.max_entries {
+            return;
+        }
+
+        let overflow = current_entries - self.config.max_entries;
+        let mut removed = 0usize;
+
+        if let Ok(mut heap) = self.eviction_index.lock() {
+            while removed < overflow {
+                let Some(Reverse(candidate)) = heap.pop() else {
+                    break;
+                };
+
+                let Some(entries) = shard_guards.get_mut(candidate.shard_index) else {
+                    continue;
+                };
+
+                let is_current = entries
+                    .get(&candidate.key)
+                    .map(|entry| entry.expires_at == candidate.expires_at)
+                    .unwrap_or(false);
+
+                if !is_current {
+                    continue;
+                }
+
+                if entries.remove(&candidate.key).is_some() {
+                    removed += 1;
+                }
+            }
+        }
+
+        if removed >= overflow {
+            return;
+        }
+
+        let mut remaining = overflow - removed;
+        for entries in &mut shard_guards {
+            while remaining > 0 {
+                let Some(key) = entries.keys().next().cloned() else {
+                    break;
+                };
+
+                entries.remove(&key);
+                remaining -= 1;
+            }
+
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
 }
 
 fn extract_first_path_segment(session: &Session) -> Option<&str> {
@@ -278,6 +709,38 @@ fn extract_host(session: &Session) -> Option<Cow<'_, str>> {
     } else {
         Some(Cow::Borrowed(host_without_port))
     }
+}
+
+fn extract_cookie_value(session: &Session, cookie_name: &str) -> Option<String> {
+    let raw = session
+        .req_header()
+        .headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())?;
+
+    raw.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        if name == cookie_name {
+            let value = value.trim();
+            if value.is_empty() || value.len() > MAX_AFFINITY_KEY_LEN {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        } else {
+            None
+        }
+    })
+}
+
+fn extract_header_value(session: &Session, header_name: &str) -> Option<String> {
+    session
+        .req_header()
+        .headers
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v.len() <= MAX_AFFINITY_KEY_LEN)
 }
 
 fn strip_first_path_segment<'a>(path_and_query: &'a str, segment: &str) -> Option<Cow<'a, str>> {

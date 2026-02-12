@@ -66,6 +66,20 @@ export type ProxyOptions = {
   applications: ApplicationOptions[];
   // Health check interval in milliseconds. Defaults to 5000 (5 seconds).
   healthCheckIntervalMs?: number;
+  stickySessions?: StickySessionOptions;
+};
+
+export type StickySessionOptions = {
+  // Defaults to true when stickySessions is provided.
+  enabled?: boolean;
+  // Browser affinity cookie name. Default: "nmt_affinity".
+  cookieName?: string;
+  // Custom affinity header for non-browser/server clients. Default: "x-nmt-affinity-key".
+  headerName?: string;
+  // Sliding expiration in milliseconds. Default: 600000 (10 minutes).
+  ttlMs?: number;
+  // Max in-memory affinity entries before oldest-expiry eviction. Default: 20000.
+  maxEntries?: number;
 };
 
 export type ListenerTlsOptions = {
@@ -191,6 +205,26 @@ Behavior:
 1. If the downstream request is an upgrade request, the proxy MUST choose an upstream from the app’s `transport: "http"` pool.
 2. If the app has no `transport: "http"` upstreams available, the request MUST fail (implementation-defined HTTP error response).
 3. `transport: "http2"` upstreams are used only for non-upgrade requests.
+
+### 5.5 Sticky sessions
+
+When `stickySessions.enabled` is true, the proxy applies server-side affinity mapping
+per `(application, transport, affinityKey)`.
+
+Affinity key source precedence:
+1. Cookie: `stickySessions.cookieName` (default `nmt_affinity`)
+2. Header: `stickySessions.headerName` (default `x-nmt-affinity-key`)
+3. If neither exists, the proxy generates a new key.
+
+Cookie behavior:
+- The proxy MUST emit `Set-Cookie` for the effective affinity key.
+- Cookie attributes: `Path=/; HttpOnly; SameSite=Lax`.
+- `Secure` MUST be added when downstream listener uses TLS.
+- Expiration is sliding (`Max-Age = ttlMs / 1000`), refreshed on each matched request.
+
+Rebinding behavior:
+- If mapped backend no longer exists for current pool or connect fails, mapping is removed.
+- Proxy retries once and rebinds to a healthy backend when available.
 
 ---
 

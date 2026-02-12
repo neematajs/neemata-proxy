@@ -74,7 +74,17 @@ impl Proxy {
     pub fn new(env: Env, options: options::ProxyOptions) -> Result<Self> {
         let parsed = options::parse_proxy_options(&env, options)?;
 
-        let router = Arc::new(router::Router::new(router::RouterConfig::default()));
+        let router = Arc::new(router::Router::new(
+            router::RouterConfig::default(),
+            router::StickySessionConfig {
+                enabled: parsed.sticky_sessions.enabled,
+                cookie_name: parsed.sticky_sessions.cookie_name.clone(),
+                header_name: parsed.sticky_sessions.header_name.clone(),
+                ttl: Duration::from_millis(parsed.sticky_sessions.ttl_ms as u64),
+                max_entries: parsed.sticky_sessions.max_entries,
+                cookie_secure: parsed.tls.is_some(),
+            },
+        ));
 
         let mut upstreams_by_app = HashMap::new();
         for app in &parsed.applications {
@@ -559,7 +569,7 @@ fn parse_port_upstream(env: &Env, upstream: UpstreamOptions) -> Result<PortUpstr
             })
         }
         Either::B(unix) => {
-            if unix.r#type != "unix_socket" {
+            if unix.r#type != "unix" && unix.r#type != "unix_socket" {
                 return Err(errors::generic_error(
                     env,
                     errors::codes::UNSUPPORTED_UPSTREAM_TYPE,
@@ -652,6 +662,13 @@ fn rebuild_app_pools(
             continue;
         }
 
+        let backends = Arc::new(
+            addrs
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<HashSet<_>>(),
+        );
+
         let mut lb = LoadBalancer::<RoundRobin>::try_from_iter(addrs).map_err(|e| {
             errors::type_error(
                 env,
@@ -682,6 +699,7 @@ fn rebuild_app_pools(
                 lb: Arc::new(lb),
                 secure,
                 verify_hostname,
+                backends,
             },
         );
     }
