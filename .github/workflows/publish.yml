@@ -167,6 +167,19 @@ jobs:
         run: pnpm napi artifacts
       - name: Add dependency files
         run: pnpm napi prepublish --no-gh-release --tag-style npm --skip-optional-publish
+      - name: Set npm package repository metadata
+        shell: bash
+        run: |
+          REPO_URL="git+https://github.com/${GITHUB_REPOSITORY}.git"
+          REPO_WEB="https://github.com/${GITHUB_REPOSITORY}"
+
+          for dir in ./npm/*; do
+            [ -d "$dir" ] || continue
+            pnpm pkg set repository.type="git" --prefix "$dir"
+            pnpm pkg set repository.url="$REPO_URL" --prefix "$dir"
+            pnpm pkg set homepage="$REPO_WEB" --prefix "$dir"
+            pnpm pkg set bugs.url="$REPO_WEB/issues" --prefix "$dir"
+          done
       - name: List packages
         run: ls -R ./npm
         shell: bash
