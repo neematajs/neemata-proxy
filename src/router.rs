@@ -15,7 +15,7 @@ use pingora::http::RequestHeader;
 use pingora::http::ResponseHeader;
 use pingora::lb::{LoadBalancer, selection::RoundRobin};
 use pingora::modules::http::HttpModules;
-use pingora::proxy::{ProxyHttp, Session};
+use pingora::proxy::{FailToProxy, ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
 
@@ -169,6 +169,15 @@ pub struct RouterCtx {
     pub affinity_key: Option<String>,
     pub should_set_cookie: bool,
     pub sticky_retry_attempted: bool,
+    pub failure_hint: Option<FailureHint>,
+}
+
+#[derive(Clone, Copy)]
+pub enum FailureHint {
+    MissingApplication,
+    MissingWsPool,
+    MissingUpstreamPool,
+    UnhealthyUpstream,
 }
 
 impl SharedRouter {
@@ -226,6 +235,14 @@ impl ProxyHttp for SharedRouter {
 
         if app_name.is_none() {
             app_name = config.default_app.clone();
+        }
+
+        if app_name.is_none() {
+            ctx.failure_hint = Some(FailureHint::MissingApplication);
+            return Err(Error::explain(
+                ErrorType::HTTPStatus(StatusCode::NOT_FOUND.as_u16()),
+                "no application matched",
+            ));
         }
 
         ctx.app_name = app_name;
@@ -290,10 +307,19 @@ impl ProxyHttp for SharedRouter {
             && let Some(pools) = config.apps.get(app_name)
             && pools.ws.is_none()
         {
-            let mut resp = ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, Some(2))?;
-            let _ = resp.insert_header(header::CONTENT_LENGTH, 0);
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
+            ctx.failure_hint = Some(FailureHint::MissingWsPool);
+            return Err(Error::explain(
+                ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+                "no ws pool available for upgrade request",
+            ));
+        }
+
+        if ctx.resolved_pool.is_none() {
+            ctx.failure_hint = Some(FailureHint::MissingUpstreamPool);
+            return Err(Error::explain(
+                ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+                "no upstream pool resolved",
+            ));
         }
 
         if let Some(resolved) = ctx.resolved_pool.as_ref() {
@@ -310,9 +336,10 @@ impl ProxyHttp for SharedRouter {
     ) -> Result<Box<HttpPeer>> {
         // Use pre-resolved pool from request_filter when available.
         let Some(resolved) = ctx.resolved_pool.as_ref() else {
+            ctx.failure_hint = Some(FailureHint::MissingUpstreamPool);
             // Fallback: no pool was resolved (no app matched or no pools configured)
             return Err(Error::explain(
-                ErrorType::InternalError,
+                ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
                 "no upstream pool resolved",
             ));
         };
@@ -331,8 +358,9 @@ impl ProxyHttp for SharedRouter {
                 mapped
             } else {
                 let Some(backend) = resolved.lb.select(affinity_key.as_bytes(), 8) else {
+                    ctx.failure_hint = Some(FailureHint::UnhealthyUpstream);
                     return Err(Error::explain(
-                        ErrorType::InternalError,
+                        ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
                         "no healthy upstreams available",
                     ));
                 };
@@ -343,8 +371,9 @@ impl ProxyHttp for SharedRouter {
             }
         } else {
             let Some(backend) = resolved.lb.select(b"", 8) else {
+                ctx.failure_hint = Some(FailureHint::UnhealthyUpstream);
                 return Err(Error::explain(
-                    ErrorType::InternalError,
+                    ErrorType::HTTPStatus(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
                     "no healthy upstreams available",
                 ));
             };
@@ -394,6 +423,35 @@ impl ProxyHttp for SharedRouter {
             })?;
 
         Ok(())
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = match ctx.failure_hint {
+            Some(FailureHint::MissingApplication) => 404,
+            Some(FailureHint::MissingWsPool)
+            | Some(FailureHint::MissingUpstreamPool)
+            | Some(FailureHint::UnhealthyUpstream) => 503,
+            None => match e.etype() {
+                ErrorType::HTTPStatus(status) => *status,
+                _ => 500,
+            },
+        };
+
+        if code > 0 {
+            session.respond_error(code).await.unwrap_or_else(|err| {
+                log::error!("failed to send error response to downstream: {err}");
+            });
+        }
+
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
     }
 
     fn fail_to_connect(

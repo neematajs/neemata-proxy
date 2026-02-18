@@ -20,9 +20,16 @@ enum ProxyState {
     Stopping,
 }
 
+#[derive(Debug, Clone)]
+enum StartStatus {
+    Pending,
+    Ready(std::result::Result<(), String>),
+}
+
 struct ProxyInner {
     options: options::ProxyOptionsParsed,
     state: ProxyState,
+    start_notifier: Option<watch::Sender<StartStatus>>,
     server: server::Server,
     router: Arc<router::Router>,
     // Upstreams are mutable; app definitions are immutable (from `options`).
@@ -94,6 +101,7 @@ impl Proxy {
         let inner = ProxyInner {
             options: parsed,
             state: ProxyState::Stopped,
+            start_notifier: None,
             server: server::Server::new(),
             router,
             upstreams_by_app,
@@ -111,22 +119,21 @@ impl Proxy {
 
     #[napi]
     pub fn start<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
-        // Requirement: `start()` resolves only after the bind attempt completes.
-        // We do the bind synchronously here so we can throw a JS Error with a stable `code`.
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
 
         match guard.state {
-            ProxyState::Stopped => {
-                guard.state = ProxyState::Starting;
-            }
             ProxyState::Starting => {
-                // Block until the other start() finishes binding by waiting for the mutex.
-                // By the time we get here, we already hold the mutex, so just decide based on
-                // the current state.
-                return env.spawn_future(async { Ok(()) });
+                let Some(notifier) = guard.start_notifier.as_ref() else {
+                    return Err(napi::Error::from_reason(
+                        "Proxy internal error: missing start notifier",
+                    ));
+                };
+
+                let mut rx = notifier.subscribe();
+                return env.spawn_future(async move { Self::wait_for_start_ready(&mut rx).await });
             }
             ProxyState::Running => {
                 return Err(errors::generic_error(
@@ -136,13 +143,23 @@ impl Proxy {
                 ));
             }
             ProxyState::Stopping => {
-                return env.spawn_future(async { Ok(()) });
+                return Err(errors::generic_error(
+                    env,
+                    errors::codes::ALREADY_STARTED,
+                    "Proxy is stopping",
+                ));
             }
+            ProxyState::Stopped => {}
         }
+
+        guard.state = ProxyState::Starting;
+        let (start_notifier, mut start_rx) = watch::channel(StartStatus::Pending);
+        guard.start_notifier = Some(start_notifier.clone());
 
         let listen = guard.options.listen.clone();
         let tls = guard.options.tls.clone();
         let server = guard.server.clone();
+        let inner = self.inner.clone();
         let shared_router = router::SharedRouter::new(guard.router.clone());
         let initial_lb_tasks = guard
             .pools
@@ -153,6 +170,11 @@ impl Proxy {
         let std_listener = std::net::TcpListener::bind(&listen).map_err(|e| {
             // Transition back to Stopped on bind failure.
             guard.state = ProxyState::Stopped;
+            if let Some(notifier) = guard.start_notifier.take() {
+                let _ = notifier.send(StartStatus::Ready(Err(
+                    "Failed to bind listener".to_string()
+                )));
+            }
             errors::generic_error(
                 env,
                 errors::codes::LISTEN_BIND_FAILED,
@@ -169,6 +191,11 @@ impl Proxy {
                     .map_err(|e| {
                     // Transition back to Stopped on TLS config failure.
                     guard.state = ProxyState::Stopped;
+                    if let Some(notifier) = guard.start_notifier.take() {
+                        let _ = notifier.send(StartStatus::Ready(Err(
+                            "Failed to configure TLS".to_string()
+                        )));
+                    }
                     errors::generic_error(
                         env,
                         errors::codes::INVALID_PROXY_OPTIONS,
@@ -187,11 +214,9 @@ impl Proxy {
         };
 
         // At this point, bind + TLS config are done.
-        // Mark Running before releasing the mutex so concurrent start/stop behave deterministically.
-        guard.state = ProxyState::Running;
         drop(guard);
 
-        // Move listener into tokio, start accept loop, then resolve.
+        // Move listener into tokio, start accept loop, then resolve when startup is fully wired.
         env.spawn_future(async move {
             let cancel = CancellationToken::new();
             let cancel_child = cancel.clone();
@@ -258,13 +283,46 @@ impl Proxy {
                 )
                 .await;
 
-            Ok(())
+            let start_result = {
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+
+                let result = match guard.state {
+                    ProxyState::Starting | ProxyState::Running => {
+                        guard.state = ProxyState::Running;
+                        Ok(())
+                    }
+                    ProxyState::Stopping | ProxyState::Stopped => {
+                        Err("Proxy start was cancelled while stopping".to_string())
+                    }
+                };
+
+                if let Some(notifier) = guard.start_notifier.take() {
+                    let _ = notifier.send(StartStatus::Ready(result.clone()));
+                }
+
+                result
+            };
+
+            if start_result.is_err() {
+                server.stop_all().await;
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+                guard.state = ProxyState::Stopped;
+                return Err(napi::Error::from_reason(
+                    "Proxy start was cancelled while stopping",
+                ));
+            }
+
+            Self::wait_for_start_ready(&mut start_rx).await
         })
     }
 
     #[napi]
     pub fn stop<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
-        let (server, inner) = {
+        let (server, inner, mut start_rx) = {
             let mut guard = self
                 .inner
                 .lock()
@@ -282,18 +340,43 @@ impl Proxy {
                 }
             }
 
-            (guard.server.clone(), self.inner.clone())
+            (
+                guard.server.clone(),
+                self.inner.clone(),
+                guard.start_notifier.as_ref().map(watch::Sender::subscribe),
+            )
         };
 
         env.spawn_future(async move {
+            if let Some(rx) = start_rx.as_mut() {
+                let _ = Self::wait_for_start_ready(rx).await;
+            }
+
             server.stop_all().await;
             if let Ok(mut guard) = inner.lock() {
                 guard.state = ProxyState::Stopped;
+                guard.start_notifier = None;
             }
             Ok(())
         })
     }
 
+    async fn wait_for_start_ready(rx: &mut watch::Receiver<StartStatus>) -> Result<()> {
+        loop {
+            let status = rx.borrow().clone();
+            match status {
+                StartStatus::Pending => {
+                    if rx.changed().await.is_err() {
+                        return Err(napi::Error::from_reason(
+                            "Proxy start channel closed unexpectedly",
+                        ));
+                    }
+                }
+                StartStatus::Ready(Ok(())) => return Ok(()),
+                StartStatus::Ready(Err(msg)) => return Err(napi::Error::from_reason(msg)),
+            }
+        }
+    }
     #[napi]
     pub fn add_upstream<'env>(
         &self,

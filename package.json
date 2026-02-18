@@ -18,7 +18,7 @@
     "build:js": "napi build --js index.js --platform --output-dir ./dist",
     "build": "$npm_execpath build:debug --release",
     "build:debug": "napi build --js index.js --platform --output-dir ./dist",
-    "test": "cargo test && vitest run"
+    "test": "cargo test && $npm_execpath build:debug && vitest run"
   },
   "napi": {
     "binaryName": "neemata-proxy",

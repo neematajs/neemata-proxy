@@ -291,6 +291,50 @@ describe('Proxy wiring', () => {
     await proxy.stop()
   })
 
+  it(
+    'concurrent start/stop leaves listener released and restartable',
+    { timeout: 15000 },
+    async () => {
+      const port = await getFreePort()
+      const proxy = new NeemataProxy({
+        listen: `127.0.0.1:${port}`,
+        applications: [{ name: 'app', routing: { default: true } }],
+      })
+
+      await proxy.addUpstream('app', {
+        type: 'port',
+        transport: 'http',
+        secure: false,
+        hostname: '127.0.0.1',
+        port: upstreamHttp1Port,
+      })
+
+      for (let i = 0; i < 5; i++) {
+        const startPromise = proxy.start()
+        const stopPromise = proxy.stop()
+        await Promise.allSettled([startPromise, stopPromise])
+
+        // Ensure final state is fully stopped.
+        await proxy.stop()
+
+        // Listener must be released.
+        const testServer = net.createServer()
+        await new Promise<void>((resolve, reject) => {
+          testServer.once('error', reject)
+          testServer.listen(port, '127.0.0.1', () => resolve())
+        })
+        await new Promise<void>((resolve) => testServer.close(() => resolve()))
+
+        // Proxy must still be restartable after a raced start/stop cycle.
+        await proxy.start()
+        const res = await httpGet(port, '/hello')
+        expect(res.status).toBe(200)
+        expect(res.body).toBe('h1:/hello')
+        await proxy.stop()
+      }
+    },
+  )
+
   it('actually releases the listener port after stop()', async () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
@@ -491,7 +535,7 @@ describe('Proxy wiring', () => {
     }
   })
 
-  it('returns 500 when no default route matches', async () => {
+  it('returns 404 when no route matches', async () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
@@ -509,7 +553,7 @@ describe('Proxy wiring', () => {
     await proxy.start()
     try {
       const res = await httpGet(port, '/nope')
-      expect(res.status).toBe(500)
+      expect(res.status).toBe(404)
     } finally {
       await proxy.stop()
     }
@@ -776,10 +820,10 @@ describe('Proxy wiring', () => {
 
     await proxy.start()
     try {
-      // No upstreams yet => bad gateway
+      // No upstreams yet => service unavailable
       await waitFor(
         async () => await httpGet(port, '/hello'),
-        (r) => r.status === 500,
+        (r) => r.status === 503,
       )
 
       // Add upstream and wait for it to become usable.
@@ -793,7 +837,7 @@ describe('Proxy wiring', () => {
       await proxy.removeUpstream('app', u)
       await waitFor(
         async () => await httpGet(port, '/hello'),
-        (r) => r.status === 500,
+        (r) => r.status === 503,
       )
     } finally {
       await proxy.stop()
