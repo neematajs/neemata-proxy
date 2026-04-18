@@ -49,7 +49,7 @@ jobs:
       - run: pnpm lint
 
   tests:
-    needs: [lint]
+    needs: [ lint ]
     strategy:
       fail-fast: true
       matrix:
@@ -57,7 +57,7 @@ jobs:
           - 24
         os:
           - blacksmith-4vcpu-ubuntu-2404
-          - macos-latest
+          - blacksmith-6vcpu-macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
