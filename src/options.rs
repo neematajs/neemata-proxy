@@ -1,6 +1,7 @@
 use crate::errors;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::collections::HashSet;
 
 #[napi(object)]
 pub struct ProxyOptions {
@@ -186,9 +187,50 @@ fn parse_application_options(
     app: ApplicationOptions,
 ) -> Result<ApplicationOptionsParsed> {
     let name = app.name;
-    let sni = app.sni;
+    let sni = parse_application_sni(env, app.sni)?;
     let routing = parse_routing(env, app.routing)?;
     Ok(ApplicationOptionsParsed { name, routing, sni })
+}
+
+fn parse_application_sni(env: &Env, sni: Option<String>) -> Result<Option<String>> {
+    let Some(sni) = sni else {
+        return Ok(None);
+    };
+
+    let sni = sni.trim();
+    if sni.is_empty() {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_APPLICATION_OPTIONS,
+            "ApplicationOptions.sni must be non-empty when provided",
+        );
+    }
+
+    if !is_hostname_like(sni) {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_APPLICATION_OPTIONS,
+            "ApplicationOptions.sni must be a hostname-like value",
+        );
+    }
+
+    Ok(Some(sni.to_string()))
+}
+
+fn is_hostname_like(value: &str) -> bool {
+    if value.starts_with('.') || value.ends_with('.') {
+        return false;
+    }
+
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 fn parse_routing(env: &Env, routing: RoutingOptions) -> Result<ApplicationRoutingParsed> {
@@ -226,8 +268,19 @@ fn parse_routing(env: &Env, routing: RoutingOptions) -> Result<ApplicationRoutin
 
 fn validate_applications(env: &Env, applications: &[ApplicationOptionsParsed]) -> Result<()> {
     let mut default_count = 0usize;
+    let mut app_names = HashSet::new();
+    let mut subdomain_routes = HashSet::new();
+    let mut path_routes = HashSet::new();
 
     for app in applications {
+        if !app_names.insert(app.name.clone()) {
+            return errors::throw_type_error(
+                env,
+                errors::codes::INVALID_APPLICATION_OPTIONS,
+                format!("Duplicate application name '{}'", app.name),
+            );
+        }
+
         match &app.routing {
             ApplicationRoutingParsed::Default => {
                 default_count += 1;
@@ -238,6 +291,15 @@ fn validate_applications(env: &Env, applications: &[ApplicationOptionsParsed]) -
                         env,
                         errors::codes::INVALID_APPLICATION_OPTIONS,
                         "subdomain routing name must be non-empty",
+                    );
+                }
+
+                let route_key = name.to_ascii_lowercase();
+                if !subdomain_routes.insert(route_key) {
+                    return errors::throw_type_error(
+                        env,
+                        errors::codes::INVALID_APPLICATION_OPTIONS,
+                        format!("Duplicate subdomain routing name '{}'", name),
                     );
                 }
             }
@@ -254,6 +316,14 @@ fn validate_applications(env: &Env, applications: &[ApplicationOptionsParsed]) -
                         env,
                         errors::codes::INVALID_APPLICATION_OPTIONS,
                         "path routing name must not contain '/'",
+                    );
+                }
+
+                if !path_routes.insert(name.clone()) {
+                    return errors::throw_type_error(
+                        env,
+                        errors::codes::INVALID_APPLICATION_OPTIONS,
+                        format!("Duplicate path routing name '{}'", name),
                     );
                 }
             }
