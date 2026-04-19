@@ -1,9 +1,24 @@
+import fs from 'node:fs/promises'
 import http from 'node:http'
+import path from 'node:path'
 
 import { describe, expect, it, vi } from 'vitest'
 
 import { Proxy as NeemataProxy } from '../dist/index.js'
 import { getFreePort, httpGet, waitFor } from './_helpers'
+
+let unixSocketCounter = 0
+
+function nextUnixSocketPath(tag: string) {
+  unixSocketCounter += 1
+  return path.join('/tmp', `nmt-sticky-${process.pid}-${tag}-${unixSocketCounter}.sock`)
+}
+
+async function cleanupUnixSocket(socketPath: string) {
+  await fs.unlink(socketPath).catch(() => { })
+}
+
+const itUnix = it.runIf(process.platform !== 'win32')
 
 describe('Proxy sticky sessions', () => {
   it('supports sticky sessions with cookie precedence over x-nmt-affinity-key', async () => {
@@ -390,6 +405,70 @@ describe('Proxy sticky sessions', () => {
       await new Promise<void>((resolve) =>
         serverB.close(() => resolve()),
       ).catch(() => { })
+    }
+  })
+
+  itUnix('supports sticky sessions across unix socket upstreams', async () => {
+    const socketA = nextUnixSocketPath('a')
+    const socketB = nextUnixSocketPath('b')
+    await cleanupUnixSocket(socketA)
+    await cleanupUnixSocket(socketB)
+
+    const serverA = http.createServer((_req, res) => {
+      res.statusCode = 200
+      res.end('sticky-uds-a')
+    })
+    const serverB = http.createServer((_req, res) => {
+      res.statusCode = 200
+      res.end('sticky-uds-b')
+    })
+
+    await new Promise<void>((resolve) => serverA.listen(socketA, resolve))
+    await new Promise<void>((resolve) => serverB.listen(socketB, resolve))
+
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+      stickySessions: {
+        enabled: true,
+        cookieName: 'nmt_affinity',
+        headerName: 'x-nmt-affinity-key',
+        ttlMs: 600000,
+      },
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'unix',
+      transport: 'http',
+      secure: false,
+      path: socketA,
+    })
+    await proxy.addUpstream('app', {
+      type: 'unix',
+      transport: 'http',
+      secure: false,
+      path: socketB,
+    })
+
+    await proxy.start()
+    try {
+      const first = await httpGet(port, '/sticky-uds', {
+        'x-nmt-affinity-key': 'uds-client',
+      })
+      expect(first.status).toBe(200)
+
+      const second = await httpGet(port, '/sticky-uds', {
+        'x-nmt-affinity-key': 'uds-client',
+      })
+      expect(second.status).toBe(200)
+      expect(second.body).toBe(first.body)
+    } finally {
+      await proxy.stop()
+      await new Promise<void>((resolve) => serverA.close(() => resolve()))
+      await new Promise<void>((resolve) => serverB.close(() => resolve()))
+      await cleanupUnixSocket(socketA)
+      await cleanupUnixSocket(socketB)
     }
   })
 })

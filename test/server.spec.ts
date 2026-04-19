@@ -1,6 +1,8 @@
+import fs from 'node:fs/promises'
 import http from 'node:http'
 import http2 from 'node:http2'
 import net from 'node:net'
+import path from 'node:path'
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import WebSocket, { WebSocketServer } from 'ws'
@@ -23,6 +25,17 @@ function trackConnections(server: net.Server) {
       socket.destroy()
     }
   }
+}
+
+let unixSocketCounter = 0
+
+function nextUnixSocketPath(tag: string) {
+  unixSocketCounter += 1
+  return path.join('/tmp', `nmt-${process.pid}-${tag}-${unixSocketCounter}.sock`)
+}
+
+async function cleanupUnixSocket(socketPath: string) {
+  await fs.unlink(socketPath).catch(() => { })
 }
 
 async function expectRejectCode(fn: () => unknown, code: string) {
@@ -79,6 +92,8 @@ async function closeWs(ws: WebSocket, timeoutMs = 1000): Promise<void> {
     }
   })
 }
+
+const itUnix = it.runIf(process.platform !== 'win32')
 
 describe('Proxy wiring', () => {
   let upstreamHttp1Port = 0
@@ -461,7 +476,45 @@ describe('Proxy wiring', () => {
     )
   })
 
-  it('rejects unix_socket upstreams with stable code', async () => {
+  itUnix('proxies to a unix socket HTTP upstream', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    const socketPath = nextUnixSocketPath('http')
+    await cleanupUnixSocket(socketPath)
+
+    const upstream = http.createServer((req, res) => {
+      res.statusCode = 200
+      res.setHeader('content-type', 'text/plain')
+      res.end(`uds-h1:${req.url ?? ''}`)
+    })
+    const closeSockets = trackConnections(upstream)
+    await new Promise<void>((resolve) => upstream.listen(socketPath, resolve))
+
+    await proxy.addUpstream('app', {
+      type: 'unix',
+      transport: 'http',
+      secure: false,
+      path: socketPath,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/hello')
+      expect(res.status).toBe(200)
+      expect(res.body).toBe('uds-h1:/hello')
+    } finally {
+      await proxy.stop()
+      closeSockets()
+      await new Promise<void>((resolve) => upstream.close(() => resolve()))
+      await cleanupUnixSocket(socketPath)
+    }
+  })
+
+  itUnix('rejects abstract unix socket upstreams with stable code', async () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
@@ -474,9 +527,9 @@ describe('Proxy wiring', () => {
           type: 'unix',
           transport: 'http',
           secure: false,
-          path: '/tmp/does-not-matter.sock',
+          path: '\0neemata-abstract-test',
         }),
-      'UnsupportedUpstreamType',
+      'InvalidProxyOptions',
     )
   })
 
@@ -617,6 +670,45 @@ describe('Proxy wiring', () => {
     }
   })
 
+  itUnix('proxies to a unix socket HTTP/2 upstream (h2c)', async () => {
+    const socketPath = nextUnixSocketPath('http2')
+    await cleanupUnixSocket(socketPath)
+
+    const upstream = http2.createServer()
+    upstream.on('stream', (stream, headers) => {
+      const path = String(headers[':path'] ?? '')
+      stream.respond({ ':status': 200, 'content-type': 'text/plain' })
+      stream.end(`uds-h2:${path}`)
+    })
+    const closeSockets = trackConnections(upstream)
+    await new Promise<void>((resolve) => upstream.listen(socketPath, resolve))
+
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'unix',
+      transport: 'http2',
+      secure: false,
+      path: socketPath,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/hello')
+      expect(res.status).toBe(200)
+      expect(res.body).toBe('uds-h2:/hello')
+    } finally {
+      await proxy.stop()
+      closeSockets()
+      await new Promise<void>((resolve) => upstream.close(() => resolve()))
+      await cleanupUnixSocket(socketPath)
+    }
+  })
+
   it('rewrites path routes by stripping the first segment', async () => {
     proxyPathRewritePort = await getFreePort()
     const proxy = new NeemataProxy({
@@ -694,6 +786,56 @@ describe('Proxy wiring', () => {
       expect(msg).toBe('echo:ping')
     } finally {
       await proxy.stop()
+    }
+  })
+
+  itUnix('proxies WebSocket upgrades to a unix socket upstream using ws', async () => {
+    const socketPath = nextUnixSocketPath('ws')
+    await cleanupUnixSocket(socketPath)
+
+    const wsHttp = http.createServer()
+    const wss = new WebSocketServer({ server: wsHttp })
+    const closeSockets = trackConnections(wsHttp)
+    wss.on('connection', (socket) => {
+      socket.on('message', (msg) => {
+        socket.send(`uds-echo:${msg.toString()}`)
+      })
+    })
+    await new Promise<void>((resolve) => wsHttp.listen(socketPath, resolve))
+
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'unix',
+      transport: 'ws',
+      secure: false,
+      path: socketPath,
+    })
+
+    await proxy.start()
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      const msg = await new Promise<string>((resolve, reject) => {
+        ws.on('open', () => ws.send('ping'))
+        ws.on('message', (data) => resolve(data.toString()))
+        ws.on('error', reject)
+      })
+      await closeWs(ws)
+
+      expect(msg).toBe('uds-echo:ping')
+    } finally {
+      await proxy.stop()
+      for (const client of wss.clients) {
+        client.terminate()
+      }
+      await new Promise<void>((resolve) => wss.close(() => resolve()))
+      closeSockets()
+      await new Promise<void>((resolve) => wsHttp.close(() => resolve()))
+      await cleanupUnixSocket(socketPath)
     }
   })
 

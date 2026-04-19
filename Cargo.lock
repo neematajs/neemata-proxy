@@ -2968,6 +2968,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "env_logger",
+ "futures",
  "http",
  "log",
  "napi",
