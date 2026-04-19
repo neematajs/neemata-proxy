@@ -226,6 +226,52 @@ describe('Proxy sticky sessions', () => {
     }
   })
 
+  it('ignores unsafe affinity header values when issuing sticky cookies', async () => {
+    const upstreamPort = await getFreePort()
+    const upstream = http.createServer((_req, res) => {
+      res.statusCode = 200
+      res.end('sticky-unsafe-header')
+    })
+
+    await new Promise<void>((resolve) =>
+      upstream.listen(upstreamPort, '127.0.0.1', resolve),
+    )
+
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+      stickySessions: { enabled: true },
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamPort,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/sticky-unsafe-header', {
+        'x-nmt-affinity-key': 'unsafe; Domain=evil.test',
+      })
+
+      expect(res.status).toBe(200)
+      const setCookie = res.headers['set-cookie']
+      const cookieValue = Array.isArray(setCookie) ? setCookie[0] : setCookie
+      expect(cookieValue).toContain('nmt_affinity=')
+      expect(cookieValue).not.toContain('Domain=evil.test')
+
+      const cookieHeader = (cookieValue ?? '').split(';')[0]
+      expect(cookieHeader).toMatch(/^nmt_affinity=[A-Za-z0-9._-]+$/)
+    } finally {
+      await proxy.stop()
+      await new Promise<void>((resolve) => upstream.close(() => resolve()))
+    }
+  })
+
   it('ignores oversized affinity cookie and falls back to header key', async () => {
     const upstreamPort = await getFreePort()
     const upstream = http.createServer((_req, res) => {
@@ -340,10 +386,10 @@ describe('Proxy sticky sessions', () => {
       await proxy.stop()
       await new Promise<void>((resolve) =>
         serverA.close(() => resolve()),
-      ).catch(() => {})
+      ).catch(() => { })
       await new Promise<void>((resolve) =>
         serverB.close(() => resolve()),
-      ).catch(() => {})
+      ).catch(() => { })
     }
   })
 })

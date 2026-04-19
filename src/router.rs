@@ -106,9 +106,7 @@ struct StickyShard {
 struct StickySessionState {
     config: StickySessionConfig,
     shards: Vec<StickyShard>,
-    eviction_index: Mutex<BinaryHeap<Reverse<EvictionItem>>>,
     key_counter: AtomicU64,
-    eviction_counter: AtomicU64,
 }
 
 const STICKY_SHARD_COUNT: usize = 64;
@@ -135,9 +133,7 @@ impl Router {
             Some(Arc::new(StickySessionState {
                 config: sticky_config,
                 shards,
-                eviction_index: Mutex::new(BinaryHeap::new()),
                 key_counter: AtomicU64::new(1),
-                eviction_counter: AtomicU64::new(1),
             }))
         } else {
             None
@@ -541,7 +537,6 @@ impl StickySessionState {
         match entries.get_mut(&key) {
             Some(entry) if entry.expires_at > now && allowed_backends.contains(&entry.backend) => {
                 entry.expires_at = now + self.config.ttl;
-                self.record_eviction_candidate(shard_index, &key, entry.expires_at);
                 Some(entry.backend.clone())
             }
             Some(_) => {
@@ -579,16 +574,6 @@ impl StickySessionState {
                 backend,
                 expires_at,
             },
-        );
-
-        self.record_eviction_candidate(
-            shard_index,
-            &AffinityMapKey {
-                app_name: app_name.to_string(),
-                transport,
-                affinity_key: affinity_key.to_string(),
-            },
-            expires_at,
         );
 
         if !self.should_cleanup(shard) {
@@ -646,24 +631,6 @@ impl StickySessionState {
         (hasher.finish() as usize) % self.shards.len()
     }
 
-    fn record_eviction_candidate(
-        &self,
-        shard_index: usize,
-        key: &AffinityMapKey,
-        expires_at: Instant,
-    ) {
-        let Ok(mut heap) = self.eviction_index.lock() else {
-            return;
-        };
-
-        heap.push(Reverse(EvictionItem {
-            expires_at,
-            sequence: self.eviction_counter.fetch_add(1, Ordering::Relaxed),
-            shard_index,
-            key: key.clone(),
-        }));
-    }
-
     fn should_cleanup(&self, shard: &StickyShard) -> bool {
         shard
             .op_counter
@@ -694,28 +661,41 @@ impl StickySessionState {
         let overflow = current_entries - self.config.max_entries;
         let mut removed = 0usize;
 
-        if let Ok(mut heap) = self.eviction_index.lock() {
-            while removed < overflow {
-                let Some(Reverse(candidate)) = heap.pop() else {
-                    break;
-                };
+        let mut eviction_candidates = BinaryHeap::new();
+        let mut sequence = 0u64;
 
-                let Some(entries) = shard_guards.get_mut(candidate.shard_index) else {
-                    continue;
-                };
+        for (shard_index, entries) in shard_guards.iter().enumerate() {
+            for (key, entry) in entries.iter() {
+                eviction_candidates.push(Reverse(EvictionItem {
+                    expires_at: entry.expires_at,
+                    sequence,
+                    shard_index,
+                    key: key.clone(),
+                }));
+                sequence += 1;
+            }
+        }
 
-                let is_current = entries
-                    .get(&candidate.key)
-                    .map(|entry| entry.expires_at == candidate.expires_at)
-                    .unwrap_or(false);
+        while removed < overflow {
+            let Some(Reverse(candidate)) = eviction_candidates.pop() else {
+                break;
+            };
 
-                if !is_current {
-                    continue;
-                }
+            let Some(entries) = shard_guards.get_mut(candidate.shard_index) else {
+                continue;
+            };
 
-                if entries.remove(&candidate.key).is_some() {
-                    removed += 1;
-                }
+            let is_current = entries
+                .get(&candidate.key)
+                .map(|entry| entry.expires_at == candidate.expires_at)
+                .unwrap_or(false);
+
+            if !is_current {
+                continue;
+            }
+
+            if entries.remove(&candidate.key).is_some() {
+                removed += 1;
             }
         }
 
@@ -780,10 +760,10 @@ fn extract_cookie_value(session: &Session, cookie_name: &str) -> Option<String> 
         let (name, value) = pair.trim().split_once('=')?;
         if name == cookie_name {
             let value = value.trim();
-            if value.is_empty() || value.len() > MAX_AFFINITY_KEY_LEN {
-                None
-            } else {
+            if is_cookie_safe_affinity_key(value) {
                 Some(value.to_string())
+            } else {
+                None
             }
         } else {
             None
@@ -798,7 +778,15 @@ fn extract_header_value(session: &Session, header_name: &str) -> Option<String> 
         .get(header_name)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty() && v.len() <= MAX_AFFINITY_KEY_LEN)
+        .filter(|v| is_cookie_safe_affinity_key(v))
+}
+
+fn is_cookie_safe_affinity_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AFFINITY_KEY_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn strip_first_path_segment<'a>(path_and_query: &'a str, segment: &str) -> Option<Cow<'a, str>> {
@@ -866,7 +854,89 @@ fn strip_port_str(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_first_path_segment;
+    use super::{
+        AffinityEntry, AffinityMapKey, StickySessionConfig, StickySessionState, StickyShard,
+        is_cookie_safe_affinity_key, strip_first_path_segment,
+    };
+    use crate::lb::TransportKind;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant};
+
+    fn sticky_state(max_entries: usize) -> StickySessionState {
+        let mut shards = Vec::with_capacity(super::STICKY_SHARD_COUNT);
+        for _ in 0..super::STICKY_SHARD_COUNT {
+            shards.push(StickyShard {
+                entries: Mutex::new(HashMap::new()),
+                op_counter: AtomicU64::new(0),
+            });
+        }
+
+        StickySessionState {
+            config: StickySessionConfig {
+                enabled: true,
+                cookie_name: "nmt_affinity".to_string(),
+                header_name: "x-nmt-affinity-key".to_string(),
+                ttl: Duration::from_secs(60),
+                max_entries,
+                cookie_secure: false,
+            },
+            shards,
+            key_counter: AtomicU64::new(1),
+        }
+    }
+
+    fn affinity_key(value: &str) -> AffinityMapKey {
+        AffinityMapKey {
+            app_name: "app".to_string(),
+            transport: TransportKind::Http1,
+            affinity_key: value.to_string(),
+        }
+    }
+
+    fn insert_entry(
+        state: &StickySessionState,
+        key: AffinityMapKey,
+        backend: &str,
+        expires_at: Instant,
+    ) {
+        let shard_index = state.shard_index_for_key(&key);
+        let mut entries = state.shards[shard_index]
+            .entries
+            .lock()
+            .expect("sticky shard mutex should not be poisoned");
+        entries.insert(
+            key,
+            AffinityEntry {
+                backend: backend.to_string(),
+                expires_at,
+            },
+        );
+    }
+
+    fn contains_entry(state: &StickySessionState, key: &AffinityMapKey) -> bool {
+        let shard_index = state.shard_index_for_key(key);
+        state.shards[shard_index]
+            .entries
+            .lock()
+            .expect("sticky shard mutex should not be poisoned")
+            .contains_key(key)
+    }
+
+    fn sticky_entry_count(state: &StickySessionState) -> usize {
+        state
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .entries
+                    .lock()
+                    .expect("sticky shard mutex should not be poisoned")
+                    .len()
+            })
+            .sum()
+    }
 
     #[test]
     fn path_rewrite_strips_exact_segment() {
@@ -1031,5 +1101,78 @@ mod tests {
         let result = normalize_host("[::1]:8080");
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result, "[::1]");
+    }
+
+    #[test]
+    fn affinity_keys_must_be_cookie_safe() {
+        assert!(is_cookie_safe_affinity_key("client-A_1.alpha"));
+        assert!(is_cookie_safe_affinity_key("generated-123"));
+
+        assert!(!is_cookie_safe_affinity_key(""));
+        assert!(!is_cookie_safe_affinity_key("bad key"));
+        assert!(!is_cookie_safe_affinity_key("bad;Domain=evil.test"));
+        assert!(!is_cookie_safe_affinity_key("bad/value"));
+    }
+
+    #[test]
+    fn sticky_cleanup_removes_expired_entries_without_overflow() {
+        let state = sticky_state(8);
+        let now = Instant::now();
+        let expired = affinity_key("expired");
+        let live = affinity_key("live");
+
+        insert_entry(
+            &state,
+            expired.clone(),
+            "127.0.0.1:3001",
+            now - Duration::from_secs(1),
+        );
+        insert_entry(
+            &state,
+            live.clone(),
+            "127.0.0.1:3002",
+            now + Duration::from_secs(30),
+        );
+
+        state.cleanup_global(now);
+
+        assert!(!contains_entry(&state, &expired));
+        assert!(contains_entry(&state, &live));
+        assert_eq!(sticky_entry_count(&state), 1);
+    }
+
+    #[test]
+    fn sticky_cleanup_evicts_oldest_live_entries_when_over_capacity() {
+        let state = sticky_state(2);
+        let now = Instant::now();
+        let oldest = affinity_key("oldest");
+        let newer = affinity_key("newer");
+        let newest = affinity_key("newest");
+
+        insert_entry(
+            &state,
+            oldest.clone(),
+            "127.0.0.1:3001",
+            now + Duration::from_secs(5),
+        );
+        insert_entry(
+            &state,
+            newer.clone(),
+            "127.0.0.1:3002",
+            now + Duration::from_secs(10),
+        );
+        insert_entry(
+            &state,
+            newest.clone(),
+            "127.0.0.1:3003",
+            now + Duration::from_secs(15),
+        );
+
+        state.cleanup_global(now);
+
+        assert!(!contains_entry(&state, &oldest));
+        assert!(contains_entry(&state, &newer));
+        assert!(contains_entry(&state, &newest));
+        assert_eq!(sticky_entry_count(&state), 2);
     }
 }

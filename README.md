@@ -19,3 +19,8 @@ It also provides a single place to manage upstreams and routing for multiple run
 - Neemata framework: https://github.com/neematajs/neemata
 - Pingora: https://github.com/cloudflare/pingora
 - N-API bindings: https://github.com/napi-rs/napi-rs
+
+## Operational notes
+
+- Dynamic upstream changes are eventually consistent with health checks. After `addUpstream()` or `start()`, a backend does not become routable until its health-check loop marks it healthy, so callers should expect a short convergence window where requests may still receive `503`.
+- The convergence window is controlled by `healthCheckIntervalMs`. Tests in this repository use polling helpers for that reason, and production callers should follow the same pattern when they need to wait for a backend to become ready.

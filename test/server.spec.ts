@@ -291,6 +291,40 @@ describe('Proxy wiring', () => {
     await proxy.stop()
   })
 
+  it('concurrent stop() callers resolve after the listener is released', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+
+    const stop1 = proxy.stop()
+    const stop2 = proxy.stop()
+
+    await stop2
+
+    await expect(httpGet(port, '/hello')).rejects.toThrow()
+
+    const testServer = net.createServer()
+    await new Promise<void>((resolve, reject) => {
+      testServer.once('error', reject)
+      testServer.listen(port, '127.0.0.1', () => resolve())
+    })
+    await new Promise<void>((resolve) => testServer.close(() => resolve()))
+
+    await stop1
+  })
+
   it(
     'concurrent start/stop leaves listener released and restartable',
     { timeout: 15000 },
@@ -463,6 +497,79 @@ describe('Proxy wiring', () => {
     } finally {
       await new Promise<void>((resolve) => blocker.close(() => resolve()))
     }
+  })
+
+  it('rejects duplicate application names with stable code', async () => {
+    const port = await getFreePort()
+
+    await expectRejectCode(
+      () =>
+        new NeemataProxy({
+          listen: `127.0.0.1:${port}`,
+          applications: [
+            { name: 'app', routing: { default: true } },
+            { name: 'app', routing: { type: 'path', name: 'auth' } },
+          ],
+        }),
+      'InvalidApplicationOptions',
+    )
+  })
+
+  it('rejects duplicate subdomain routes case-insensitively', async () => {
+    const port = await getFreePort()
+
+    await expectRejectCode(
+      () =>
+        new NeemataProxy({
+          listen: `127.0.0.1:${port}`,
+          applications: [
+            {
+              name: 'first',
+              routing: { type: 'subdomain', name: 'Example.com' },
+            },
+            {
+              name: 'second',
+              routing: { type: 'subdomain', name: 'example.com' },
+            },
+          ],
+        }),
+      'InvalidApplicationOptions',
+    )
+  })
+
+  it('rejects duplicate path routes with stable code', async () => {
+    const port = await getFreePort()
+
+    await expectRejectCode(
+      () =>
+        new NeemataProxy({
+          listen: `127.0.0.1:${port}`,
+          applications: [
+            { name: 'first', routing: { type: 'path', name: 'auth' } },
+            { name: 'second', routing: { type: 'path', name: 'auth' } },
+          ],
+        }),
+      'InvalidApplicationOptions',
+    )
+  })
+
+  it('rejects invalid ApplicationOptions.sni values', async () => {
+    const port = await getFreePort()
+
+    await expectRejectCode(
+      () =>
+        new NeemataProxy({
+          listen: `127.0.0.1:${port}`,
+          applications: [
+            {
+              name: 'app',
+              routing: { default: true },
+              sni: 'bad/value',
+            },
+          ],
+        }),
+      'InvalidApplicationOptions',
+    )
   })
 
   it('requires ApplicationOptions.sni for secure upstreams on default routing', async () => {
@@ -948,7 +1055,7 @@ describe('Proxy wiring', () => {
     } finally {
       await proxy.stop()
       await new Promise<void>((resolve) => http1a.close(() => resolve())).catch(
-        () => {},
+        () => { },
       )
       await new Promise<void>((resolve) => http1b.close(() => resolve()))
     }
