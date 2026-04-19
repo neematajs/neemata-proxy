@@ -2,7 +2,7 @@ use crate::lb;
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,7 @@ use pingora::http::RequestHeader;
 use pingora::http::ResponseHeader;
 use pingora::lb::{LoadBalancer, selection::RoundRobin};
 use pingora::modules::http::HttpModules;
+use pingora::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
 use pingora::proxy::{FailToProxy, ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
@@ -39,7 +40,7 @@ pub struct PoolConfig {
     pub lb: Arc<LoadBalancer<RoundRobin>>,
     pub secure: bool,
     pub verify_hostname: String,
-    pub backends: Arc<HashSet<String>>,
+    pub backends: Arc<HashMap<String, PingoraSocketAddr>>,
 }
 
 /// Pre-resolved pool information cached in context to avoid repeated lookups.
@@ -50,7 +51,7 @@ pub struct ResolvedPool {
     pub verify_hostname: String,
     pub is_http2: bool,
     pub transport: lb::TransportKind,
-    pub backends: Arc<HashSet<String>>,
+    pub backends: Arc<HashMap<String, PingoraSocketAddr>>,
 }
 
 #[derive(Clone)]
@@ -148,6 +149,16 @@ impl Router {
     #[allow(dead_code)]
     pub fn update(&self, config: RouterConfig) {
         self.config.store(Arc::new(config));
+    }
+}
+
+pub(crate) fn backend_key_for_addr(addr: &PingoraSocketAddr) -> Option<String> {
+    match addr {
+        PingoraSocketAddr::Inet(addr) => Some(addr.to_string()),
+        #[cfg(unix)]
+        PingoraSocketAddr::Unix(addr) => addr
+            .as_pathname()
+            .map(|path| format!("unix:{}", path.display())),
     }
 }
 
@@ -361,7 +372,12 @@ impl ProxyHttp for SharedRouter {
                     ));
                 };
 
-                let selected = backend.addr.to_string();
+                let Some(selected) = backend_key_for_addr(&backend.addr) else {
+                    return Err(Error::explain(
+                        ErrorType::InternalError,
+                        "selected backend has unsupported address type",
+                    ));
+                };
                 sticky.bind(app_name, resolved.transport, affinity_key, selected.clone());
                 selected
             }
@@ -373,14 +389,45 @@ impl ProxyHttp for SharedRouter {
                     "no healthy upstreams available",
                 ));
             };
-            backend.addr.to_string()
+            let Some(selected) = backend_key_for_addr(&backend.addr) else {
+                return Err(Error::explain(
+                    ErrorType::InternalError,
+                    "selected backend has unsupported address type",
+                ));
+            };
+            selected
         };
 
-        let mut peer = HttpPeer::new(
-            selected_addr.as_str(),
-            resolved.secure,
-            resolved.verify_hostname.clone(),
-        );
+        let Some(selected_addr) = resolved.backends.get(&selected_addr) else {
+            return Err(Error::explain(
+                ErrorType::InternalError,
+                "selected backend missing from resolved pool",
+            ));
+        };
+
+        let mut peer = match selected_addr {
+            PingoraSocketAddr::Inet(addr) => {
+                HttpPeer::new(*addr, resolved.secure, resolved.verify_hostname.clone())
+            }
+            #[cfg(unix)]
+            PingoraSocketAddr::Unix(addr) => {
+                let Some(path) = addr.as_pathname() else {
+                    return Err(Error::explain(
+                        ErrorType::InternalError,
+                        "non-pathname unix sockets are not supported",
+                    ));
+                };
+                let path = path.to_string_lossy().into_owned();
+                HttpPeer::new_uds(&path, resolved.secure, resolved.verify_hostname.clone())
+                    .map_err(|e| {
+                        Error::because(
+                            ErrorType::InternalError,
+                            "failed to construct unix upstream peer",
+                            e,
+                        )
+                    })?
+            }
+        };
         // For plaintext HTTP/2 upstreams (h2c), Pingora needs the peer's min HTTP version to be 2,
         // otherwise it will assume HTTP/1.1 when no ALPN is present.
         if resolved.is_http2 {
@@ -517,7 +564,7 @@ impl StickySessionState {
         app_name: &str,
         transport: lb::TransportKind,
         affinity_key: &str,
-        allowed_backends: &HashSet<String>,
+        allowed_backends: &HashMap<String, PingoraSocketAddr>,
     ) -> Option<String> {
         let now = Instant::now();
         let key = AffinityMapKey {
@@ -535,7 +582,9 @@ impl StickySessionState {
         let mut entries = shard.entries.lock().ok()?;
 
         match entries.get_mut(&key) {
-            Some(entry) if entry.expires_at > now && allowed_backends.contains(&entry.backend) => {
+            Some(entry)
+                if entry.expires_at > now && allowed_backends.contains_key(&entry.backend) =>
+            {
                 entry.expires_at = now + self.config.ttl;
                 Some(entry.backend.clone())
             }

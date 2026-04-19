@@ -2,12 +2,13 @@ use crate::{errors, lb, options, router, server};
 use napi::bindgen_prelude::*;
 use napi::bindgen_prelude::execute_tokio_future;
 use napi_derive::napi;
-use pingora::lb::{LoadBalancer, health_check::TcpHealthCheck, selection::RoundRobin};
-use std::collections::{HashMap, HashSet};
+use pingora::lb::{Backend, Extensions, health_check::TcpHealthCheck};
+use pingora::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::ToSocketAddrs;
 #[cfg(unix)]
-use std::os::unix::io::IntoRawFd;
+use std::os::unix::{io::IntoRawFd, net::SocketAddr as StdUnixSocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, watch};
@@ -66,17 +67,23 @@ struct ProxyInner {
     server: server::Server,
     router: Arc<router::Router>,
     // Upstreams are mutable; app definitions are immutable (from `options`).
-    upstreams_by_app: HashMap<String, HashSet<PortUpstream>>,
+    upstreams_by_app: HashMap<String, HashSet<Upstream>>,
     // One pool per (app, transport).
     pools: HashMap<(String, lb::TransportKind), router::PoolConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PortUpstream {
+struct Upstream {
     transport: lb::TransportKind,
     secure: bool,
-    hostname: String,
-    port: u16,
+    target: UpstreamTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum UpstreamTarget {
+    Inet { hostname: String, port: u16 },
+    #[cfg(unix)]
+    Unix { path: String },
 }
 
 #[napi(object)]
@@ -441,7 +448,7 @@ impl Proxy {
         app_name: String,
         upstream: UpstreamOptions,
     ) -> Result<PromiseRaw<'env, ()>> {
-        let upstream = parse_port_upstream(env, upstream)?;
+        let upstream = parse_upstream(env, upstream)?;
 
         let inner = self.inner.clone();
         let update_lock = self.update_lock.clone();
@@ -571,7 +578,7 @@ impl Proxy {
         app_name: String,
         upstream: UpstreamOptions,
     ) -> Result<PromiseRaw<'env, ()>> {
-        let upstream = parse_port_upstream(env, upstream)?;
+        let upstream = parse_upstream(env, upstream)?;
 
         let inner = self.inner.clone();
         let update_lock = self.update_lock.clone();
@@ -801,7 +808,20 @@ fn lb_service_name(app: &str, transport: lb::TransportKind) -> String {
     }
 }
 
-fn parse_port_upstream(env: &Env, upstream: UpstreamOptions) -> Result<PortUpstream> {
+fn parse_transport(env: &Env, transport: &str) -> Result<lb::TransportKind> {
+    match transport {
+        "http" => Ok(lb::TransportKind::Http1),
+        "http2" => Ok(lb::TransportKind::Http2),
+        "ws" => Ok(lb::TransportKind::Ws),
+        other => errors::throw_type_error(
+            env,
+            errors::codes::INVALID_PROXY_OPTIONS,
+            format!("Unknown upstream transport '{other}'"),
+        ),
+    }
+}
+
+fn parse_upstream(env: &Env, upstream: UpstreamOptions) -> Result<Upstream> {
     match upstream {
         Either::A(port) => {
             if port.r#type != "port" {
@@ -812,18 +832,7 @@ fn parse_port_upstream(env: &Env, upstream: UpstreamOptions) -> Result<PortUpstr
                 ));
             }
 
-            let transport = match port.transport.as_str() {
-                "http" => lb::TransportKind::Http1,
-                "http2" => lb::TransportKind::Http2,
-                "ws" => lb::TransportKind::Ws,
-                other => {
-                    return errors::throw_type_error(
-                        env,
-                        errors::codes::INVALID_PROXY_OPTIONS,
-                        format!("Unknown upstream transport '{other}'"),
-                    );
-                }
-            };
+            let transport = parse_transport(env, port.transport.as_str())?;
 
             if port.port == 0 || port.port > u16::MAX as u32 {
                 return errors::throw_type_error(
@@ -841,11 +850,13 @@ fn parse_port_upstream(env: &Env, upstream: UpstreamOptions) -> Result<PortUpstr
                 );
             }
 
-            Ok(PortUpstream {
+            Ok(Upstream {
                 transport,
                 secure: port.secure,
-                hostname: port.hostname,
-                port: port.port as u16,
+                target: UpstreamTarget::Inet {
+                    hostname: port.hostname,
+                    port: port.port as u16,
+                },
             })
         }
         Either::B(unix) => {
@@ -856,13 +867,59 @@ fn parse_port_upstream(env: &Env, upstream: UpstreamOptions) -> Result<PortUpstr
                     format!("Unsupported upstream type '{}'", unix.r#type),
                 ));
             }
-            Err(errors::generic_error(
-                env,
-                errors::codes::UNSUPPORTED_UPSTREAM_TYPE,
-                "unix_socket upstreams are not supported",
-            ))
+
+            let transport = parse_transport(env, unix.transport.as_str())?;
+
+            #[cfg(not(unix))]
+            {
+                let _ = transport;
+                let _ = unix;
+                Err(errors::generic_error(
+                    env,
+                    errors::codes::UNSUPPORTED_UPSTREAM_TYPE,
+                    "unix_socket upstreams are only supported on Unix platforms",
+                ))
+            }
+
+            #[cfg(unix)]
+            {
+                if unix.path.is_empty() {
+                    return errors::throw_type_error(
+                        env,
+                        errors::codes::INVALID_PROXY_OPTIONS,
+                        "UnixSocketUpstreamOptions.path must be non-empty",
+                    );
+                }
+
+                Ok(Upstream {
+                    transport,
+                    secure: unix.secure,
+                    target: UpstreamTarget::Unix { path: unix.path },
+                })
+            }
         }
     }
+}
+
+fn insert_backend(
+    backends: &mut BTreeSet<Backend>,
+    backend_addrs: &mut HashMap<String, PingoraSocketAddr>,
+    addr: PingoraSocketAddr,
+) -> DeferredResult<()> {
+    let Some(key) = router::backend_key_for_addr(&addr) else {
+        return Err(DeferredJsError::type_error(
+            errors::codes::INVALID_PROXY_OPTIONS,
+            "Only pathname-based unix sockets are supported as upstreams",
+        ));
+    };
+
+    backends.insert(Backend {
+        addr: addr.clone(),
+        weight: 1,
+        ext: Extensions::new(),
+    });
+    backend_addrs.insert(key, addr);
+    Ok(())
 }
 
 fn verify_hostname_for_secure_upstream(
@@ -885,13 +942,13 @@ fn verify_hostname_for_secure_upstream(
 
 fn rebuild_app_pools(
     app: &options::ApplicationOptionsParsed,
-    upstreams: &HashSet<PortUpstream>,
+    upstreams: &HashSet<Upstream>,
     health_check_interval_ms: u32,
 ) -> DeferredResult<(
     HashMap<lb::TransportKind, router::PoolConfig>,
     Vec<lb::TransportKind>,
 )> {
-    let mut by_transport: HashMap<lb::TransportKind, Vec<&PortUpstream>> = HashMap::new();
+    let mut by_transport: HashMap<lb::TransportKind, Vec<&Upstream>> = HashMap::new();
     for u in upstreams {
         by_transport.entry(u.transport).or_default().push(u);
     }
@@ -917,37 +974,56 @@ fn rebuild_app_pools(
             String::new()
         };
 
-        let mut addrs = Vec::new();
+        let mut lb_backends = BTreeSet::new();
+        let mut backend_addrs = HashMap::new();
         for u in &list {
-            let iter = (u.hostname.as_str(), u.port)
-                .to_socket_addrs()
-                .map_err(|e| {
-                    DeferredJsError::type_error(
-                        errors::codes::INVALID_PROXY_OPTIONS,
-                        format!("Failed to resolve upstream '{}:{}': {e}", u.hostname, u.port),
-                    )
-                })?;
-            addrs.extend(iter);
+            match &u.target {
+                UpstreamTarget::Inet { hostname, port } => {
+                    let iter = (hostname.as_str(), *port).to_socket_addrs().map_err(|e| {
+                        DeferredJsError::type_error(
+                            errors::codes::INVALID_PROXY_OPTIONS,
+                            format!("Failed to resolve upstream '{}:{}': {e}", hostname, port),
+                        )
+                    })?;
+
+                    let mut resolved_any = false;
+                    for addr in iter {
+                        resolved_any = true;
+                        insert_backend(
+                            &mut lb_backends,
+                            &mut backend_addrs,
+                            PingoraSocketAddr::Inet(addr),
+                        )?;
+                    }
+
+                    if !resolved_any {
+                        return Err(DeferredJsError::type_error(
+                            errors::codes::INVALID_PROXY_OPTIONS,
+                            format!(
+                                "Failed to resolve upstream '{}:{}': no addresses were returned",
+                                hostname, port
+                            ),
+                        ));
+                    }
+                }
+                #[cfg(unix)]
+                UpstreamTarget::Unix { path } => {
+                    let addr = StdUnixSocketAddr::from_pathname(path).map_err(|e| {
+                        DeferredJsError::type_error(
+                            errors::codes::INVALID_PROXY_OPTIONS,
+                            format!("Failed to use unix upstream '{}': {e}", path),
+                        )
+                    })?;
+                    insert_backend(
+                        &mut lb_backends,
+                        &mut backend_addrs,
+                        PingoraSocketAddr::Unix(addr),
+                    )?;
+                }
+            }
         }
 
-        if addrs.is_empty() {
-            return Err(DeferredJsError::type_error(
-                errors::codes::INVALID_PROXY_OPTIONS,
-                format!(
-                    "Failed to resolve upstream '{}:{}': no addresses were returned",
-                    list[0].hostname, list[0].port
-                ),
-            ));
-        }
-
-        let backends = Arc::new(
-            addrs
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect::<HashSet<_>>(),
-        );
-
-        let mut lb = LoadBalancer::<RoundRobin>::try_from_iter(addrs).map_err(|e| {
+        let mut lb = lb::build_round_robin_lb(lb_backends).map_err(|e| {
             DeferredJsError::type_error(
                 errors::codes::INVALID_PROXY_OPTIONS,
                 format!("Failed to build load balancer: {e}"),
@@ -976,7 +1052,7 @@ fn rebuild_app_pools(
                 lb: Arc::new(lb),
                 secure,
                 verify_hostname,
-                backends,
+                backends: Arc::new(backend_addrs),
             },
         );
     }
