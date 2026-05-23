@@ -152,6 +152,41 @@ impl Router {
 }
 
 #[derive(Clone)]
+struct ResolvedRoute {
+    app_name: String,
+    path_rewrite_segment: Option<String>,
+}
+
+fn resolve_route(
+    config: &RouterConfig,
+    host: Option<&str>,
+    path_first_segment: Option<&str>,
+) -> Option<ResolvedRoute> {
+    if let Some(host) = host
+        && let Some(app_name) = config.subdomain_routes.get(host)
+    {
+        return Some(ResolvedRoute {
+            app_name: app_name.clone(),
+            path_rewrite_segment: None,
+        });
+    }
+
+    if let Some(seg) = path_first_segment
+        && let Some(app_name) = config.path_routes.get(seg)
+    {
+        return Some(ResolvedRoute {
+            app_name: app_name.clone(),
+            path_rewrite_segment: Some(seg.to_string()),
+        });
+    }
+
+    config.default_app.as_ref().map(|app_name| ResolvedRoute {
+        app_name: app_name.clone(),
+        path_rewrite_segment: None,
+    })
+}
+
+#[derive(Clone)]
 pub struct SharedRouter(pub Arc<Router>);
 
 #[derive(Clone, Default)]
@@ -214,35 +249,17 @@ impl ProxyHttp for SharedRouter {
         let path_first_segment = extract_first_path_segment(session);
         let is_upgrade = session.is_upgrade_req();
 
-        let mut app_name: Option<String> = None;
-        let mut rewrite_segment: Option<String> = None;
-
-        if let Some(host) = host.as_deref() {
-            app_name = config.subdomain_routes.get(host).cloned();
-        }
-
-        if app_name.is_none()
-            && let Some(seg) = path_first_segment
-            && let Some(app) = config.path_routes.get(seg).cloned()
-        {
-            app_name = Some(app);
-            rewrite_segment = Some(seg.to_string());
-        }
-
-        if app_name.is_none() {
-            app_name = config.default_app.clone();
-        }
-
-        if app_name.is_none() {
+        let Some(resolved_route) = resolve_route(&config, host.as_deref(), path_first_segment)
+        else {
             ctx.failure_hint = Some(FailureHint::MissingApplication);
             return Err(Error::explain(
                 ErrorType::HTTPStatus(StatusCode::NOT_FOUND.as_u16()),
                 "no application matched",
             ));
-        }
+        };
 
-        ctx.app_name = app_name;
-        ctx.path_rewrite_segment = rewrite_segment;
+        ctx.app_name = Some(resolved_route.app_name);
+        ctx.path_rewrite_segment = resolved_route.path_rewrite_segment;
         ctx.is_upgrade = is_upgrade;
 
         // Pre-resolve the pool to avoid repeated HashMap lookups in upstream_peer.
@@ -852,11 +869,95 @@ fn strip_port_str(host: &str) -> &str {
     }
 }
 
+#[doc(hidden)]
+pub mod bench {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    pub use super::RouterConfig;
+    use super::{StickySessionConfig, StickySessionState, StickyShard, resolve_route};
+    use crate::lb;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    pub struct BenchStickySessions {
+        state: StickySessionState,
+        allowed_backends: HashSet<String>,
+    }
+
+    impl BenchStickySessions {
+        pub fn new(max_entries: usize) -> Self {
+            let backend = "127.0.0.1:3000".to_string();
+            let mut allowed_backends = HashSet::new();
+            allowed_backends.insert(backend);
+
+            Self {
+                state: StickySessionState {
+                    config: StickySessionConfig {
+                        enabled: true,
+                        cookie_name: "nmt_affinity".to_string(),
+                        header_name: "x-nmt-affinity-key".to_string(),
+                        ttl: Duration::from_secs(600),
+                        max_entries,
+                        cookie_secure: false,
+                    },
+                    shards: (0..super::STICKY_SHARD_COUNT)
+                        .map(|_| StickyShard {
+                            entries: Mutex::new(std::collections::HashMap::new()),
+                            op_counter: AtomicU64::new(0),
+                        })
+                        .collect(),
+                    key_counter: AtomicU64::new(1),
+                },
+                allowed_backends,
+            }
+        }
+
+        pub fn bind(&self, affinity_key: &str) {
+            self.state.bind(
+                "app",
+                lb::TransportKind::Http1,
+                affinity_key,
+                "127.0.0.1:3000".to_string(),
+            );
+        }
+
+        pub fn lookup(&self, affinity_key: &str) -> Option<String> {
+            self.state.lookup(
+                "app",
+                lb::TransportKind::Http1,
+                affinity_key,
+                &self.allowed_backends,
+            )
+        }
+
+        pub fn generate_affinity_key(&self) -> String {
+            self.state.generate_affinity_key()
+        }
+    }
+
+    pub fn resolve_route_for_bench(
+        config: &RouterConfig,
+        host: Option<&str>,
+        path_first_segment: Option<&str>,
+    ) -> Option<(String, Option<String>)> {
+        resolve_route(config, host, path_first_segment)
+            .map(|route| (route.app_name, route.path_rewrite_segment))
+    }
+
+    pub fn strip_first_path_segment_for_bench(
+        path_and_query: &str,
+        segment: &str,
+    ) -> Option<String> {
+        super::strip_first_path_segment(path_and_query, segment).map(|path| path.into_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AffinityEntry, AffinityMapKey, StickySessionConfig, StickySessionState, StickyShard,
-        is_cookie_safe_affinity_key, strip_first_path_segment,
+        is_cookie_safe_affinity_key, resolve_route, strip_first_path_segment,
     };
     use crate::lb::TransportKind;
     use std::collections::HashMap;
@@ -936,6 +1037,31 @@ mod tests {
                     .len()
             })
             .sum()
+    }
+
+    #[test]
+    fn route_resolution_prefers_subdomain_then_path_then_default() {
+        let config = super::RouterConfig {
+            subdomain_routes: HashMap::from([("app.test".to_string(), "subdomain".to_string())]),
+            path_routes: HashMap::from([("app".to_string(), "path".to_string())]),
+            default_app: Some("default".to_string()),
+            apps: HashMap::new(),
+        };
+
+        let route =
+            resolve_route(&config, Some("app.test"), Some("app")).expect("subdomain should match");
+        assert_eq!(route.app_name, "subdomain");
+        assert_eq!(route.path_rewrite_segment, None);
+
+        let route =
+            resolve_route(&config, Some("missing.test"), Some("app")).expect("path should match");
+        assert_eq!(route.app_name, "path");
+        assert_eq!(route.path_rewrite_segment, Some("app".to_string()));
+
+        let route = resolve_route(&config, Some("missing.test"), Some("missing"))
+            .expect("default should match");
+        assert_eq!(route.app_name, "default");
+        assert_eq!(route.path_rewrite_segment, None);
     }
 
     #[test]
