@@ -122,7 +122,6 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       version_tag: v${{ inputs.version }}
     steps:
       - name: Checkout
@@ -188,7 +187,6 @@ jobs:
       - run: rm $(find ./dist -name '*.node')
       - name: Publish
         run: |
-          pnpm config set -g "//registry.npmjs.org/:_authToken=${NPM_TOKEN}"
           TAG=$(node scripts/tag.js "${{ inputs.version }}")
           pnpm access list packages nmtjs
           pnpm config set provenance true
