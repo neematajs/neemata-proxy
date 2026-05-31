@@ -188,7 +188,6 @@ jobs:
       - name: Publish
         run: |
           TAG=$(node scripts/tag.js "${{ inputs.version }}")
-          pnpm access list packages nmtjs
           pnpm config set provenance true
           pnpm publish --filter "./npm/*" --dry-run --access public --no-git-checks --tag "$TAG"
           pnpm publish --filter "." --dry-run --access public --no-git-checks --tag "$TAG"
