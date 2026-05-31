@@ -1,6 +1,7 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc};
 
-use pingora::lb::{LoadBalancer, selection::RoundRobin};
+use futures::FutureExt;
+use pingora::lb::{Backend, Backends, LoadBalancer, discovery, selection::RoundRobin};
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use tokio::sync::watch;
@@ -15,14 +16,19 @@ pub enum TransportKind {
     Ws,
 }
 
-#[allow(dead_code)]
 pub fn build_round_robin_lb(
-    addrs: Vec<SocketAddr>,
-    health_check_frequency: Option<Duration>,
-) -> std::io::Result<Arc<LoadBalancer<RoundRobin>>> {
-    let mut lb = LoadBalancer::<RoundRobin>::try_from_iter(addrs)?;
-    lb.health_check_frequency = health_check_frequency;
-    Ok(Arc::new(lb))
+    backends: BTreeSet<Backend>,
+) -> std::io::Result<LoadBalancer<RoundRobin>> {
+    let discovery = discovery::Static::new(backends);
+    let backends = Backends::new(discovery);
+    let lb = LoadBalancer::<RoundRobin>::from_backends(backends);
+
+    lb.update()
+        .now_or_never()
+        .expect("static backend discovery should not block")
+        .map_err(|e| std::io::Error::other(format!("failed to update load balancer: {e}")))?;
+
+    Ok(lb)
 }
 
 #[allow(dead_code)]

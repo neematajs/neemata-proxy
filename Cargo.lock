@@ -3078,6 +3078,7 @@ dependencies = [
  "async-trait",
  "criterion",
  "env_logger",
+ "futures",
  "http",
  "log",
  "napi",
