@@ -196,6 +196,53 @@ describe('Proxy wiring', () => {
     }
   })
 
+  it('exposes the bound listener address while running', async () => {
+    const ephemeralProxy = new NeemataProxy({
+      listen: '127.0.0.1:0',
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    expect(ephemeralProxy.address()).toBeNull()
+
+    await ephemeralProxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await ephemeralProxy.start()
+    try {
+      const address = ephemeralProxy.address()
+      expect(address?.hostname).toBe('127.0.0.1')
+      expect(address?.port).toBeGreaterThan(0)
+
+      const res = await httpGet(address?.port ?? 0, '/hello')
+      expect(res.status).toBe(200)
+      expect(res.body).toBe('h1:/hello')
+    } finally {
+      await ephemeralProxy.stop()
+    }
+    expect(ephemeralProxy.address()).toBeNull()
+
+    const fixedPort = await getFreePort()
+    const fixedProxy = new NeemataProxy({
+      listen: `127.0.0.1:${fixedPort}`,
+      applications: [{ name: 'app', routing: { default: true } }],
+    })
+
+    await fixedProxy.start()
+    try {
+      expect(fixedProxy.address()).toEqual({
+        hostname: '127.0.0.1',
+        port: fixedPort,
+      })
+    } finally {
+      await fixedProxy.stop()
+    }
+  })
+
   it('rejects calling start() twice with AlreadyStarted', async () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
@@ -561,11 +608,7 @@ describe('Proxy wiring', () => {
         new NeemataProxy({
           listen: `127.0.0.1:${port}`,
           applications: [
-            {
-              name: 'app',
-              routing: { default: true },
-              sni: 'bad/value',
-            },
+            { name: 'app', routing: { default: true }, sni: 'bad/value' },
           ],
         }),
       'InvalidApplicationOptions',
@@ -1055,7 +1098,7 @@ describe('Proxy wiring', () => {
     } finally {
       await proxy.stop()
       await new Promise<void>((resolve) => http1a.close(() => resolve())).catch(
-        () => { },
+        () => {},
       )
       await new Promise<void>((resolve) => http1b.close(() => resolve()))
     }

@@ -1,11 +1,11 @@
 use crate::{errors, lb, options, router, server};
-use napi::bindgen_prelude::*;
 use napi::bindgen_prelude::execute_tokio_future;
+use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use pingora::lb::{LoadBalancer, health_check::TcpHealthCheck, selection::RoundRobin};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::io::IntoRawFd;
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,7 @@ impl DeferredJsError {
 struct ProxyInner {
     options: options::ProxyOptionsParsed,
     state: ProxyState,
+    listen_address: Option<BoundListenAddress>,
     start_notifier: Option<watch::Sender<StartStatus>>,
     stop_notifier: Option<watch::Sender<StopStatus>>,
     server: server::Server,
@@ -77,6 +78,36 @@ struct PortUpstream {
     secure: bool,
     hostname: String,
     port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundListenAddress {
+    hostname: String,
+    port: u16,
+}
+
+#[napi(object)]
+pub struct ProxyAddress {
+    pub hostname: String,
+    pub port: u32,
+}
+
+impl From<SocketAddr> for BoundListenAddress {
+    fn from(addr: SocketAddr) -> Self {
+        Self {
+            hostname: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
+}
+
+impl From<&BoundListenAddress> for ProxyAddress {
+    fn from(address: &BoundListenAddress) -> Self {
+        Self {
+            hostname: address.hostname.clone(),
+            port: address.port as u32,
+        }
+    }
 }
 
 #[napi(object)]
@@ -135,6 +166,7 @@ impl Proxy {
         let inner = ProxyInner {
             options: parsed,
             state: ProxyState::Stopped,
+            listen_address: None,
             start_notifier: None,
             stop_notifier: None,
             server: server::Server::new(),
@@ -170,7 +202,8 @@ impl Proxy {
                     };
 
                     let mut rx = notifier.subscribe();
-                    return env.spawn_future(async move { Self::wait_for_start_ready(&mut rx).await });
+                    return env
+                        .spawn_future(async move { Self::wait_for_start_ready(&mut rx).await });
                 }
                 ProxyState::Running => {
                     return Err(errors::generic_error(
@@ -190,6 +223,7 @@ impl Proxy {
             }
 
             guard.state = ProxyState::Starting;
+            guard.listen_address = None;
             let (start_notifier, start_rx) = watch::channel(StartStatus::Pending);
             guard.start_notifier = Some(start_notifier);
 
@@ -219,21 +253,21 @@ impl Proxy {
         // startup is fully wired.
         spawn_deferred_result(env, async move {
             let listen_for_setup = listen.clone();
-            let setup_result = tokio::task::spawn_blocking(move || {
-                build_start_resources(&listen_for_setup, tls)
-            })
-            .await
-            .map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "Proxy start task failed during listener setup: {e}"
-                ))
-            })?;
+            let setup_result =
+                tokio::task::spawn_blocking(move || build_start_resources(&listen_for_setup, tls))
+                    .await
+                    .map_err(|e| {
+                        napi::Error::from_reason(format!(
+                            "Proxy start task failed during listener setup: {e}"
+                        ))
+                    })?;
 
-            let (std_listener, tls_settings) = match setup_result {
+            let (std_listener, tls_settings, listen_address) = match setup_result {
                 Ok(resources) => resources,
                 Err(err) => {
                     if let Ok(mut guard) = inner.lock() {
                         guard.state = ProxyState::Stopped;
+                        guard.listen_address = None;
                         if let Some(notifier) = guard.start_notifier.take() {
                             let _ = notifier.send(StartStatus::Ready(Err(err.message.clone())));
                         }
@@ -288,8 +322,13 @@ impl Proxy {
                         .await;
 
                     #[cfg(windows)]
-                    svc.start_service(shutdown_rx, conf.listener_tasks_per_fd)
-                        .await;
+                    {
+                        // Windows artifacts are not currently published. This fallback lets
+                        // Pingora bind from `listen`, so `listen: ...:0` is not guaranteed to
+                        // match `listen_address`; ephemeral-port reporting is supported on Unix.
+                        svc.start_service(shutdown_rx, conf.listener_tasks_per_fd)
+                            .await;
+                    }
                 });
 
                 tokio::select! {
@@ -316,6 +355,7 @@ impl Proxy {
                 let result = match guard.state {
                     ProxyState::Starting | ProxyState::Running => {
                         guard.state = ProxyState::Running;
+                        guard.listen_address = Some(listen_address);
                         Ok(())
                     }
                     ProxyState::Stopping | ProxyState::Stopped => {
@@ -336,6 +376,7 @@ impl Proxy {
                     .lock()
                     .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
                 guard.state = ProxyState::Stopped;
+                guard.listen_address = None;
                 return Err(napi::Error::from_reason(
                     "Proxy start was cancelled while stopping",
                 ));
@@ -356,6 +397,7 @@ impl Proxy {
 
             match guard.state {
                 ProxyState::Stopped => {
+                    guard.listen_address = None;
                     return env.spawn_future(async { Ok(()) });
                 }
                 ProxyState::Stopping => {
@@ -366,7 +408,8 @@ impl Proxy {
                     };
 
                     let mut rx = notifier.subscribe();
-                    return env.spawn_future(async move { Self::wait_for_stop_ready(&mut rx).await });
+                    return env
+                        .spawn_future(async move { Self::wait_for_stop_ready(&mut rx).await });
                 }
                 ProxyState::Starting | ProxyState::Running => {
                     guard.state = ProxyState::Stopping;
@@ -392,6 +435,7 @@ impl Proxy {
             server.stop_all().await;
             if let Ok(mut guard) = inner.lock() {
                 guard.state = ProxyState::Stopped;
+                guard.listen_address = None;
                 guard.start_notifier = None;
                 if let Some(notifier) = guard.stop_notifier.take() {
                     let _ = notifier.send(StopStatus::Ready);
@@ -435,6 +479,20 @@ impl Proxy {
     }
 
     #[napi]
+    pub fn address(&self) -> Result<Option<ProxyAddress>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+
+        if guard.state != ProxyState::Running {
+            return Ok(None);
+        }
+
+        Ok(guard.listen_address.as_ref().map(ProxyAddress::from))
+    }
+
+    #[napi]
     pub fn add_upstream<'env>(
         &self,
         env: &'env Env,
@@ -446,122 +504,119 @@ impl Proxy {
         let inner = self.inner.clone();
         let update_lock = self.update_lock.clone();
 
-        spawn_deferred_result(
-            env,
-            async move {
-                let _update_guard = update_lock.lock().await;
+        spawn_deferred_result(env, async move {
+            let _update_guard = update_lock.lock().await;
 
-                let (server, app_def, health_check_interval_ms, mut next_upstreams) = {
-                    let guard = inner
-                        .lock()
-                        .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+            let (server, app_def, health_check_interval_ms, mut next_upstreams) = {
+                let guard = inner
+                    .lock()
+                    .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
 
-                    let Some(app_def) = guard
-                        .options
-                        .applications
-                        .iter()
-                        .find(|a| a.name == app_name)
-                        .cloned()
-                    else {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UNKNOWN_APPLICATION,
-                            format!("Unknown application '{app_name}'"),
-                        )));
-                    };
-
-                    let Some(current_upstreams) = guard.upstreams_by_app.get(&app_name) else {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UNKNOWN_APPLICATION,
-                            format!("Unknown application '{app_name}'"),
-                        )));
-                    };
-
-                    if current_upstreams.contains(&upstream) {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UPSTREAM_ALREADY_EXISTS,
-                            "Upstream already exists",
-                        )));
-                    }
-
-                    (
-                        guard.server.clone(),
-                        app_def,
-                        guard.options.health_check_interval_ms,
-                        current_upstreams.clone(),
-                    )
+                let Some(app_def) = guard
+                    .options
+                    .applications
+                    .iter()
+                    .find(|a| a.name == app_name)
+                    .cloned()
+                else {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UNKNOWN_APPLICATION,
+                        format!("Unknown application '{app_name}'"),
+                    )));
                 };
 
-                next_upstreams.insert(upstream.clone());
+                let Some(current_upstreams) = guard.upstreams_by_app.get(&app_name) else {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UNKNOWN_APPLICATION,
+                        format!("Unknown application '{app_name}'"),
+                    )));
+                };
 
-                if upstream.secure
-                    && let Err(err) = verify_hostname_for_secure_upstream(&app_def)
-                {
-                    return Ok(Err(err));
+                if current_upstreams.contains(&upstream) {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UPSTREAM_ALREADY_EXISTS,
+                        "Upstream already exists",
+                    )));
                 }
 
-                let rebuilt = tokio::task::spawn_blocking({
-                    let app_def = app_def.clone();
-                    let next_upstreams = next_upstreams.clone();
-                    move || rebuild_app_pools(&app_def, &next_upstreams, health_check_interval_ms)
-                })
-                .await
-                .map_err(|e| {
-                    napi::Error::from_reason(format!(
-                        "Upstream rebuild task failed while adding upstream: {e}"
-                    ))
-                })?;
+                (
+                    guard.server.clone(),
+                    app_def,
+                    guard.options.health_check_interval_ms,
+                    current_upstreams.clone(),
+                )
+            };
 
-                let (new_pools, removed_transports) = match rebuilt {
-                    Ok(pools) => pools,
-                    Err(err) => return Ok(Err(err)),
+            next_upstreams.insert(upstream.clone());
+
+            if upstream.secure
+                && let Err(err) = verify_hostname_for_secure_upstream(&app_def)
+            {
+                return Ok(Err(err));
+            }
+
+            let rebuilt = tokio::task::spawn_blocking({
+                let app_def = app_def.clone();
+                let next_upstreams = next_upstreams.clone();
+                move || rebuild_app_pools(&app_def, &next_upstreams, health_check_interval_ms)
+            })
+            .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "Upstream rebuild task failed while adding upstream: {e}"
+                ))
+            })?;
+
+            let (new_pools, removed_transports) = match rebuilt {
+                Ok(pools) => pools,
+                Err(err) => return Ok(Err(err)),
+            };
+
+            let (is_running, to_upsert, to_remove) = {
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+
+                let Some(upstreams) = guard.upstreams_by_app.get_mut(&app_name) else {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UNKNOWN_APPLICATION,
+                        format!("Unknown application '{app_name}'"),
+                    )));
                 };
+                *upstreams = next_upstreams;
 
-                let (is_running, to_upsert, to_remove) = {
-                    let mut guard = inner
-                        .lock()
-                        .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+                let mut to_upsert = Vec::new();
+                let mut to_remove = Vec::new();
 
-                    let Some(upstreams) = guard.upstreams_by_app.get_mut(&app_name) else {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UNKNOWN_APPLICATION,
-                            format!("Unknown application '{app_name}'"),
-                        )));
-                    };
-                    *upstreams = next_upstreams;
-
-                    let mut to_upsert = Vec::new();
-                    let mut to_remove = Vec::new();
-
-                    for (transport, pool) in new_pools {
-                        to_upsert.push((lb_service_name(&app_name, transport), pool.lb.clone()));
-                        guard.pools.insert((app_name.clone(), transport), pool);
-                    }
-                    for transport in removed_transports {
-                        if guard.pools.remove(&(app_name.clone(), transport)).is_some() {
-                            to_remove.push(lb_service_name(&app_name, transport));
-                        }
-                    }
-
-                    let cfg = build_router_config(&guard.options, &guard.pools);
-                    guard.router.update(cfg);
-
-                    (guard.state == ProxyState::Running, to_upsert, to_remove)
-                };
-
-                if is_running {
-                    for (name, lb) in to_upsert {
-                        server
-                            .upsert_service(name, lb::spawn_lb_health_task(lb))
-                            .await;
-                    }
-                    for name in to_remove {
-                        server.remove_service(&name).await;
+                for (transport, pool) in new_pools {
+                    to_upsert.push((lb_service_name(&app_name, transport), pool.lb.clone()));
+                    guard.pools.insert((app_name.clone(), transport), pool);
+                }
+                for transport in removed_transports {
+                    if guard.pools.remove(&(app_name.clone(), transport)).is_some() {
+                        to_remove.push(lb_service_name(&app_name, transport));
                     }
                 }
 
-                Ok(Ok(()))
-            },
-        )
+                let cfg = build_router_config(&guard.options, &guard.pools);
+                guard.router.update(cfg);
+
+                (guard.state == ProxyState::Running, to_upsert, to_remove)
+            };
+
+            if is_running {
+                for (name, lb) in to_upsert {
+                    server
+                        .upsert_service(name, lb::spawn_lb_health_task(lb))
+                        .await;
+                }
+                for name in to_remove {
+                    server.remove_service(&name).await;
+                }
+            }
+
+            Ok(Ok(()))
+        })
     }
 
     #[napi]
@@ -576,116 +631,113 @@ impl Proxy {
         let inner = self.inner.clone();
         let update_lock = self.update_lock.clone();
 
-        spawn_deferred_result(
-            env,
-            async move {
-                let _update_guard = update_lock.lock().await;
+        spawn_deferred_result(env, async move {
+            let _update_guard = update_lock.lock().await;
 
-                let (server, app_def, health_check_interval_ms, mut next_upstreams) = {
-                    let guard = inner
-                        .lock()
-                        .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+            let (server, app_def, health_check_interval_ms, mut next_upstreams) = {
+                let guard = inner
+                    .lock()
+                    .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
 
-                    let Some(app_def) = guard
-                        .options
-                        .applications
-                        .iter()
-                        .find(|a| a.name == app_name)
-                        .cloned()
-                    else {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UNKNOWN_APPLICATION,
-                            format!("Unknown application '{app_name}'"),
-                        )));
-                    };
-
-                    let Some(current_upstreams) = guard.upstreams_by_app.get(&app_name) else {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UNKNOWN_APPLICATION,
-                            format!("Unknown application '{app_name}'"),
-                        )));
-                    };
-
-                    if !current_upstreams.contains(&upstream) {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UPSTREAM_NOT_FOUND,
-                            "Upstream not found",
-                        )));
-                    }
-
-                    (
-                        guard.server.clone(),
-                        app_def,
-                        guard.options.health_check_interval_ms,
-                        current_upstreams.clone(),
-                    )
+                let Some(app_def) = guard
+                    .options
+                    .applications
+                    .iter()
+                    .find(|a| a.name == app_name)
+                    .cloned()
+                else {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UNKNOWN_APPLICATION,
+                        format!("Unknown application '{app_name}'"),
+                    )));
                 };
 
-                next_upstreams.remove(&upstream);
-
-                let rebuilt = tokio::task::spawn_blocking({
-                    let app_def = app_def.clone();
-                    let next_upstreams = next_upstreams.clone();
-                    move || rebuild_app_pools(&app_def, &next_upstreams, health_check_interval_ms)
-                })
-                .await
-                .map_err(|e| {
-                    napi::Error::from_reason(format!(
-                        "Upstream rebuild task failed while removing upstream: {e}"
-                    ))
-                })?;
-
-                let (new_pools, removed_transports) = match rebuilt {
-                    Ok(pools) => pools,
-                    Err(err) => return Ok(Err(err)),
+                let Some(current_upstreams) = guard.upstreams_by_app.get(&app_name) else {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UNKNOWN_APPLICATION,
+                        format!("Unknown application '{app_name}'"),
+                    )));
                 };
 
-                let (is_running, to_upsert, to_remove) = {
-                    let mut guard = inner
-                        .lock()
-                        .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+                if !current_upstreams.contains(&upstream) {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UPSTREAM_NOT_FOUND,
+                        "Upstream not found",
+                    )));
+                }
 
-                    let Some(upstreams) = guard.upstreams_by_app.get_mut(&app_name) else {
-                        return Ok(Err(DeferredJsError::generic(
-                            errors::codes::UNKNOWN_APPLICATION,
-                            format!("Unknown application '{app_name}'"),
-                        )));
-                    };
-                    *upstreams = next_upstreams;
+                (
+                    guard.server.clone(),
+                    app_def,
+                    guard.options.health_check_interval_ms,
+                    current_upstreams.clone(),
+                )
+            };
 
-                    let mut to_upsert = Vec::new();
-                    let mut to_remove = Vec::new();
+            next_upstreams.remove(&upstream);
 
-                    for (transport, pool) in new_pools {
-                        to_upsert.push((lb_service_name(&app_name, transport), pool.lb.clone()));
-                        guard.pools.insert((app_name.clone(), transport), pool);
-                    }
-                    for transport in removed_transports {
-                        if guard.pools.remove(&(app_name.clone(), transport)).is_some() {
-                            to_remove.push(lb_service_name(&app_name, transport));
-                        }
-                    }
+            let rebuilt = tokio::task::spawn_blocking({
+                let app_def = app_def.clone();
+                let next_upstreams = next_upstreams.clone();
+                move || rebuild_app_pools(&app_def, &next_upstreams, health_check_interval_ms)
+            })
+            .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "Upstream rebuild task failed while removing upstream: {e}"
+                ))
+            })?;
 
-                    let cfg = build_router_config(&guard.options, &guard.pools);
-                    guard.router.update(cfg);
+            let (new_pools, removed_transports) = match rebuilt {
+                Ok(pools) => pools,
+                Err(err) => return Ok(Err(err)),
+            };
 
-                    (guard.state == ProxyState::Running, to_upsert, to_remove)
+            let (is_running, to_upsert, to_remove) = {
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| napi::Error::from_reason("Proxy mutex poisoned"))?;
+
+                let Some(upstreams) = guard.upstreams_by_app.get_mut(&app_name) else {
+                    return Ok(Err(DeferredJsError::generic(
+                        errors::codes::UNKNOWN_APPLICATION,
+                        format!("Unknown application '{app_name}'"),
+                    )));
                 };
+                *upstreams = next_upstreams;
 
-                if is_running {
-                    for (name, lb) in to_upsert {
-                        server
-                            .upsert_service(name, lb::spawn_lb_health_task(lb))
-                            .await;
-                    }
-                    for name in to_remove {
-                        server.remove_service(&name).await;
+                let mut to_upsert = Vec::new();
+                let mut to_remove = Vec::new();
+
+                for (transport, pool) in new_pools {
+                    to_upsert.push((lb_service_name(&app_name, transport), pool.lb.clone()));
+                    guard.pools.insert((app_name.clone(), transport), pool);
+                }
+                for transport in removed_transports {
+                    if guard.pools.remove(&(app_name.clone(), transport)).is_some() {
+                        to_remove.push(lb_service_name(&app_name, transport));
                     }
                 }
 
-                Ok(Ok(()))
-            },
-        )
+                let cfg = build_router_config(&guard.options, &guard.pools);
+                guard.router.update(cfg);
+
+                (guard.state == ProxyState::Running, to_upsert, to_remove)
+            };
+
+            if is_running {
+                for (name, lb) in to_upsert {
+                    server
+                        .upsert_service(name, lb::spawn_lb_health_task(lb))
+                        .await;
+                }
+                for name in to_remove {
+                    server.remove_service(&name).await;
+                }
+            }
+
+            Ok(Ok(()))
+        })
     }
 }
 
@@ -715,11 +767,19 @@ fn build_start_resources(
 ) -> DeferredResult<(
     std::net::TcpListener,
     Option<pingora::listeners::tls::TlsSettings>,
+    BoundListenAddress,
 )> {
     let std_listener = std::net::TcpListener::bind(listen).map_err(|e| {
         DeferredJsError::generic(
             errors::codes::LISTEN_BIND_FAILED,
             format!("Failed to bind listener on '{listen}': {e}"),
+        )
+    })?;
+
+    let listen_address = std_listener.local_addr().map_err(|e| {
+        DeferredJsError::generic(
+            errors::codes::LISTEN_BIND_FAILED,
+            format!("Failed to read bound listener address for '{listen}': {e}"),
         )
     })?;
 
@@ -731,19 +791,17 @@ fn build_start_resources(
     })?;
 
     let tls_settings = if let Some(tls) = tls {
-        let mut settings = pingora::listeners::tls::TlsSettings::intermediate(
-            &tls.cert_path,
-            &tls.key_path,
-        )
-        .map_err(|e| {
-            DeferredJsError::type_error(
-                errors::codes::INVALID_PROXY_OPTIONS,
-                format!(
-                    "Failed to configure TLS using cert '{}' and key '{}': {e}",
-                    tls.cert_path, tls.key_path
-                ),
-            )
-        })?;
+        let mut settings =
+            pingora::listeners::tls::TlsSettings::intermediate(&tls.cert_path, &tls.key_path)
+                .map_err(|e| {
+                    DeferredJsError::type_error(
+                        errors::codes::INVALID_PROXY_OPTIONS,
+                        format!(
+                            "Failed to configure TLS using cert '{}' and key '{}': {e}",
+                            tls.cert_path, tls.key_path
+                        ),
+                    )
+                })?;
 
         if tls.enable_h2 {
             settings.enable_h2();
@@ -754,7 +812,7 @@ fn build_start_resources(
         None
     };
 
-    Ok((std_listener, tls_settings))
+    Ok((std_listener, tls_settings, listen_address.into()))
 }
 
 fn build_router_config(
@@ -924,7 +982,10 @@ fn rebuild_app_pools(
                 .map_err(|e| {
                     DeferredJsError::type_error(
                         errors::codes::INVALID_PROXY_OPTIONS,
-                        format!("Failed to resolve upstream '{}:{}': {e}", u.hostname, u.port),
+                        format!(
+                            "Failed to resolve upstream '{}:{}': {e}",
+                            u.hostname, u.port
+                        ),
                     )
                 })?;
             addrs.extend(iter);

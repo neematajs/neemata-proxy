@@ -386,10 +386,10 @@ describe('Proxy sticky sessions', () => {
       await proxy.stop()
       await new Promise<void>((resolve) =>
         serverA.close(() => resolve()),
-      ).catch(() => { })
+      ).catch(() => {})
       await new Promise<void>((resolve) =>
         serverB.close(() => resolve()),
-      ).catch(() => { })
+      ).catch(() => {})
     }
   })
 })
