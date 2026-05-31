@@ -322,8 +322,13 @@ impl Proxy {
                         .await;
 
                     #[cfg(windows)]
-                    svc.start_service(shutdown_rx, conf.listener_tasks_per_fd)
-                        .await;
+                    {
+                        // Windows artifacts are not currently published. This fallback lets
+                        // Pingora bind from `listen`, so `listen: ...:0` is not guaranteed to
+                        // match `listen_address`; ephemeral-port reporting is supported on Unix.
+                        svc.start_service(shutdown_rx, conf.listener_tasks_per_fd)
+                            .await;
+                    }
                 });
 
                 tokio::select! {
