@@ -27,6 +27,20 @@ importers:
         specifier: ^8.18.3
         version: 8.19.0
 
+  npm/darwin-arm64: {}
+
+  npm/darwin-x64: {}
+
+  npm/linux-arm-gnueabihf: {}
+
+  npm/linux-arm64-gnu: {}
+
+  npm/linux-arm64-musl: {}
+
+  npm/linux-x64-gnu: {}
+
+  npm/linux-x64-musl: {}
+
 packages:
 
   '@biomejs/biome@2.3.13':
