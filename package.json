@@ -1,7 +1,6 @@
 {
   "name": "@nmtjs/proxy",
   "description": "Rust-based reverse proxy for Neemata, exposed via NAPI.",
-  "version": "1.0.0",
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -45,5 +44,14 @@
     "LICENSE.md",
     "README.md"
   ],
-  "packageManager": "pnpm@11.5.0+sha512.dbfcc4f81cf48597afd4bc391ffdf12c11f1a9fb83a395bfa6b0a2d9cc2fd8ffebafdb1ccbd529632153f793904c2615b7f09fe1a345473fd1c35845172a8eb1"
+  "packageManager": "pnpm@11.5.0+sha512.dbfcc4f81cf48597afd4bc391ffdf12c11f1a9fb83a395bfa6b0a2d9cc2fd8ffebafdb1ccbd529632153f793904c2615b7f09fe1a345473fd1c35845172a8eb1",
+  "optionalDependencies": {
+    "@nmtjs/proxy-darwin-x64": "workspace:",
+    "@nmtjs/proxy-darwin-arm64": "workspace:",
+    "@nmtjs/proxy-linux-x64-gnu": "workspace:",
+    "@nmtjs/proxy-linux-x64-musl": "workspace:",
+    "@nmtjs/proxy-linux-arm64-gnu": "workspace:",
+    "@nmtjs/proxy-linux-arm64-musl": "workspace:",
+    "@nmtjs/proxy-linux-arm-gnueabihf": "workspace:"
+  }
 }
