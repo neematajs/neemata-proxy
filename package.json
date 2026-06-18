@@ -13,11 +13,12 @@
   "scripts": {
     "fmt": "$npm_execpath biome check --diagnostic-level=error --write . && cargo fmt",
     "lint": "$npm_execpath biome lint --diagnostic-level=error . && cargo clippy",
+    "check:type": "tsgo -p tsconfig.json --noEmit",
     "build:artifact": "napi build --release",
     "build:js": "napi build --js index.js --platform --output-dir ./dist",
     "build": "$npm_execpath build:debug --release",
     "build:debug": "napi build --js index.js --platform --output-dir ./dist",
-    "test": "cargo test && $npm_execpath build:debug && vitest run"
+    "test": "cargo test && $npm_execpath build:debug && $npm_execpath check:type && vitest run"
   },
   "napi": {
     "binaryName": "neemata-proxy",
@@ -36,6 +37,7 @@
     "@biomejs/biome": "2.3.13",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.1",
+    "@typescript/native-preview": "7.0.0-dev.20260421.2",
     "vitest": "4.0.18",
     "ws": "^8.18.3"
   },

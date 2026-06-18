@@ -38,16 +38,15 @@ pub struct ListenerTlsOptions {
 #[napi(object)]
 pub struct ApplicationOptions {
     pub name: String,
-    pub routing: RoutingOptions,
+    pub routing: ProxyApplicationRouting,
     pub sni: Option<String>,
 }
 
-#[napi(object)]
-pub struct RoutingOptions {
-    #[napi(ts_type = " 'subdomain' | 'path' ")]
-    pub r#type: Option<String>,
-    pub name: Option<String>,
-    pub default: Option<bool>,
+#[napi(object_from_js, discriminant = "type", discriminant_case = "lowercase")]
+pub enum ProxyApplicationRouting {
+    Path { name: Option<String> },
+    Subdomain { name: Option<String> },
+    Default,
 }
 
 #[derive(Debug, Clone)]
@@ -231,37 +230,30 @@ fn is_hostname_like(value: &str) -> bool {
     })
 }
 
-fn parse_routing(env: &Env, routing: RoutingOptions) -> Result<ApplicationRoutingParsed> {
-    if routing.default.unwrap_or(false) {
-        return Ok(ApplicationRoutingParsed::Default);
+fn parse_routing(env: &Env, routing: ProxyApplicationRouting) -> Result<ApplicationRoutingParsed> {
+    match routing {
+        ProxyApplicationRouting::Default => Ok(ApplicationRoutingParsed::Default),
+        ProxyApplicationRouting::Subdomain { name } => {
+            let name = require_routing_name(env, "subdomain", name)?;
+            Ok(ApplicationRoutingParsed::Subdomain { name })
+        }
+        ProxyApplicationRouting::Path { name } => {
+            let name = require_routing_name(env, "path", name)?;
+            Ok(ApplicationRoutingParsed::Path { name })
+        }
     }
+}
 
-    let Some(routing_type) = routing.r#type else {
+fn require_routing_name(env: &Env, routing_type: &str, name: Option<String>) -> Result<String> {
+    let Some(name) = name else {
         return errors::throw_type_error(
             env,
             errors::codes::INVALID_APPLICATION_OPTIONS,
-            "ApplicationOptions.routing.type must be set unless routing.default=true",
-        );
-    };
-    let Some(routing_name) = routing.name else {
-        return errors::throw_type_error(
-            env,
-            errors::codes::INVALID_APPLICATION_OPTIONS,
-            "ApplicationOptions.routing.name must be set unless routing.default=true",
+            format!("ApplicationOptions.routing.name must be set for {routing_type} routing"),
         );
     };
 
-    match routing_type.as_str() {
-        "subdomain" => Ok(ApplicationRoutingParsed::Subdomain { name: routing_name }),
-        "path" => Ok(ApplicationRoutingParsed::Path { name: routing_name }),
-        other => errors::throw_type_error(
-            env,
-            errors::codes::INVALID_APPLICATION_OPTIONS,
-            format!(
-                "Unknown routing.type '{other}'. Expected 'subdomain' or 'path', or use routing.default=true"
-            ),
-        ),
-    }
+    Ok(name)
 }
 
 fn validate_applications(env: &Env, applications: &[ApplicationOptionsParsed]) -> Result<()> {
@@ -332,7 +324,7 @@ fn validate_applications(env: &Env, applications: &[ApplicationOptionsParsed]) -
         return errors::throw_type_error(
             env,
             errors::codes::INVALID_APPLICATION_OPTIONS,
-            "At most one application may have routing.default=true",
+            "At most one application may use routing.type='default'",
         );
     }
 

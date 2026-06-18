@@ -14,6 +14,35 @@ The proxy separates request routing and transport work from application logic so
 
 It also provides a single place to manage upstreams and routing for multiple runtime workers, which keeps orchestration consistent across transports.
 
+## Routing
+
+Each application declares exactly one routing strategy:
+
+```ts
+type ProxyApplicationRouting =
+  | { type: 'path'; name?: string }
+  | { type: 'subdomain'; name?: string }
+  | { type: 'default' }
+```
+
+- `type: 'path'` routes by the first path segment, then strips that segment before proxying upstream.
+- `type: 'subdomain'` routes by host/subdomain.
+- `type: 'default'` is the catch-all app used when no subdomain or path route matches.
+
+Only one application may use `type: 'default'`.
+
+Migration: replace old default routing objects:
+
+```ts
+{ routing: { default: true } }
+```
+
+with:
+
+```ts
+{ routing: { type: 'default' } }
+```
+
 ## Related projects
 
 - Neemata framework: https://github.com/neematajs/neemata
