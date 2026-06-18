@@ -25,7 +25,11 @@ function trackConnections(server: net.Server) {
   }
 }
 
-async function expectRejectCode(fn: () => unknown, code: string) {
+async function expectRejectCode(
+  fn: () => unknown,
+  code: string,
+  message?: string | RegExp,
+) {
   let err: any
   try {
     const maybePromise = fn()
@@ -35,6 +39,11 @@ async function expectRejectCode(fn: () => unknown, code: string) {
   }
   expect(err).toBeTruthy()
   expect(err).toHaveProperty('code', code)
+  if (message instanceof RegExp) {
+    expect(String(err.message)).toMatch(message)
+  } else if (message) {
+    expect(String(err.message)).toContain(message)
+  }
 }
 
 async function waitForWsFailure(
@@ -176,7 +185,7 @@ describe('Proxy wiring', () => {
     proxyHttp1Port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${proxyHttp1Port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -199,7 +208,7 @@ describe('Proxy wiring', () => {
   it('exposes the bound listener address while running', async () => {
     const ephemeralProxy = new NeemataProxy({
       listen: '127.0.0.1:0',
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     expect(ephemeralProxy.address()).toBeNull()
@@ -229,7 +238,7 @@ describe('Proxy wiring', () => {
     const fixedPort = await getFreePort()
     const fixedProxy = new NeemataProxy({
       listen: `127.0.0.1:${fixedPort}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await fixedProxy.start()
@@ -247,7 +256,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -270,7 +279,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -319,7 +328,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     // stop before start
@@ -342,7 +351,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -379,7 +388,7 @@ describe('Proxy wiring', () => {
       const port = await getFreePort()
       const proxy = new NeemataProxy({
         listen: `127.0.0.1:${port}`,
-        applications: [{ name: 'app', routing: { default: true } }],
+        applications: [{ name: 'app', routing: { type: 'default' } }],
       })
 
       await proxy.addUpstream('app', {
@@ -420,7 +429,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -450,7 +459,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await expectRejectCode(
@@ -470,7 +479,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     const u = {
@@ -492,7 +501,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await expectRejectCode(
@@ -512,7 +521,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await expectRejectCode(
@@ -536,7 +545,7 @@ describe('Proxy wiring', () => {
 
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     try {
@@ -554,7 +563,7 @@ describe('Proxy wiring', () => {
         new NeemataProxy({
           listen: `127.0.0.1:${port}`,
           applications: [
-            { name: 'app', routing: { default: true } },
+            { name: 'app', routing: { type: 'default' } },
             { name: 'app', routing: { type: 'path', name: 'auth' } },
           ],
         }),
@@ -600,6 +609,23 @@ describe('Proxy wiring', () => {
     )
   })
 
+  it('rejects multiple default routes with stable code', async () => {
+    const port = await getFreePort()
+
+    await expectRejectCode(
+      () =>
+        new NeemataProxy({
+          listen: `127.0.0.1:${port}`,
+          applications: [
+            { name: 'first', routing: { type: 'default' } },
+            { name: 'second', routing: { type: 'default' } },
+          ],
+        }),
+      'InvalidApplicationOptions',
+      /At most one application may use routing\.type='default'/,
+    )
+  })
+
   it('rejects invalid ApplicationOptions.sni values', async () => {
     const port = await getFreePort()
 
@@ -608,7 +634,7 @@ describe('Proxy wiring', () => {
         new NeemataProxy({
           listen: `127.0.0.1:${port}`,
           applications: [
-            { name: 'app', routing: { default: true }, sni: 'bad/value' },
+            { name: 'app', routing: { type: 'default' }, sni: 'bad/value' },
           ],
         }),
       'InvalidApplicationOptions',
@@ -619,7 +645,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await expectRejectCode(
@@ -639,7 +665,7 @@ describe('Proxy wiring', () => {
     proxyHttp2Port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${proxyHttp2Port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -713,7 +739,7 @@ describe('Proxy wiring', () => {
     proxyWsPort = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${proxyWsPort}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -744,7 +770,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -802,7 +828,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -892,7 +918,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     await proxy.addUpstream('app', {
@@ -917,7 +943,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     const u1 = {
@@ -957,7 +983,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     const u = {
@@ -1026,7 +1052,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       // Fast health checks for testing
       healthCheckIntervalMs: 200,
     })
@@ -1108,7 +1134,7 @@ describe('Proxy wiring', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
     })
 
     const u = {

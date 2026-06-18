@@ -34,7 +34,7 @@ describe('Proxy sticky sessions', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       stickySessions: {
         enabled: true,
         cookieName: 'nmt_affinity',
@@ -105,7 +105,7 @@ describe('Proxy sticky sessions', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       stickySessions: { enabled: true, cookieName: 'nmt_affinity' },
     })
 
@@ -154,7 +154,7 @@ describe('Proxy sticky sessions', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       stickySessions: { enabled: true, ttlMs: 120000 },
     })
 
@@ -196,7 +196,7 @@ describe('Proxy sticky sessions', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       stickySessions: { enabled: true },
     })
 
@@ -240,7 +240,7 @@ describe('Proxy sticky sessions', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       stickySessions: { enabled: true },
     })
 
@@ -286,7 +286,7 @@ describe('Proxy sticky sessions', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       stickySessions: { enabled: true },
     })
 
@@ -339,7 +339,7 @@ describe('Proxy sticky sessions', () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
       listen: `127.0.0.1:${port}`,
-      applications: [{ name: 'app', routing: { default: true } }],
+      applications: [{ name: 'app', routing: { type: 'default' } }],
       stickySessions: { enabled: true },
       healthCheckIntervalMs: 200,
     })
