@@ -164,6 +164,8 @@ jobs:
         run: pnpm napi create-npm-dirs
       - name: Move artifacts
         run: pnpm napi artifacts
+      - name: Build JS bindings
+        run: pnpm build:js
       - name: Add dependency files
         run: pnpm napi prepublish --no-gh-release --tag-style npm --skip-optional-publish
       - name: Set npm package repository metadata
@@ -182,8 +184,6 @@ jobs:
       - name: List packages
         run: ls -R ./npm
         shell: bash
-      - name: Build JS bindings
-        run: pnpm build:js
       - run: rm $(find ./dist -name '*.node')
       - name: Publish
         run: |
