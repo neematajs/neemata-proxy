@@ -46,6 +46,46 @@ async function expectRejectCode(
   }
 }
 
+async function httpRequest(
+  port: number,
+  options: {
+    method?: string
+    path?: string
+    headers?: Record<string, string>
+    body?: string | Buffer
+  },
+): Promise<{
+  status: number
+  body: string
+  headers: http.IncomingHttpHeaders
+}> {
+  return await new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method: options.method ?? 'GET',
+        path: options.path ?? '/',
+        headers: options.headers,
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (c) => chunks.push(Buffer.from(c)))
+        res.on('end', () => {
+          resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+            headers: res.headers,
+          })
+        })
+      },
+    )
+    req.on('error', reject)
+    if (options.body) req.end(options.body)
+    else req.end()
+  })
+}
+
 async function waitForWsFailure(
   ws: WebSocket,
   timeoutMs = 1000,
@@ -641,6 +681,36 @@ describe('Proxy wiring', () => {
     )
   })
 
+  it('rejects zero limit option values with stable code', async () => {
+    const port = await getFreePort()
+
+    await expectRejectCode(
+      () =>
+        new NeemataProxy({
+          listen: `127.0.0.1:${port}`,
+          applications: [{ name: 'app', routing: { type: 'default' } }],
+          limits: { maxUriSize: 0 },
+        } as any),
+      'InvalidProxyOptions',
+      'limits.maxUriSize must be greater than 0',
+    )
+  })
+
+  it('rejects zero timeout option values with stable code', async () => {
+    const port = await getFreePort()
+
+    await expectRejectCode(
+      () =>
+        new NeemataProxy({
+          listen: `127.0.0.1:${port}`,
+          applications: [{ name: 'app', routing: { type: 'default' } }],
+          timeouts: { upstreamConnect: 0 },
+        } as any),
+      'InvalidProxyOptions',
+      'timeouts.upstreamConnect must be greater than 0',
+    )
+  })
+
   it('requires ApplicationOptions.sni for secure upstreams on default routing', async () => {
     const port = await getFreePort()
     const proxy = new NeemataProxy({
@@ -730,6 +800,198 @@ describe('Proxy wiring', () => {
     try {
       const res = await httpGet(port, '/nope')
       expect(res.status).toBe(404)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('rejects URI over configured maxUriSize with 414', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: { maxUriSize: 32 },
+    } as any)
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, `/${'a'.repeat(64)}`)
+      expect(res.status).toBe(414)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('allows over-limit requests when limits is null', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: null,
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, `/${'a'.repeat(9000)}`)
+      expect(res.status).toBe(200)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('allows a request when a specific limit is null', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: { maxUriSize: null },
+    })
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, `/${'a'.repeat(9000)}`)
+      expect(res.status).toBe(200)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('rejects too many request headers with 431', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: { maxRequestHeaders: 4 },
+    } as any)
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/hello', {
+        'x-test-1': '1',
+        'x-test-2': '2',
+        'x-test-3': '3',
+        'x-test-4': '4',
+        'x-test-5': '5',
+      })
+      expect(res.status).toBe(431)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('rejects request headers over configured maxRequestHeaderSize with 431', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: { maxRequestHeaderSize: 64 },
+    } as any)
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/hello', {
+        'x-large-header': 'x'.repeat(256),
+      })
+      expect(res.status).toBe(431)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('rejects a single request header over configured maxSingleHeaderSize with 431', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: { maxSingleHeaderSize: 16 },
+    } as any)
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpGet(port, '/hello', {
+        'x-large-header': 'x'.repeat(32),
+      })
+      expect(res.status).toBe(431)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('rejects Content-Length over configured maxRequestBodySize with 413', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: { maxRequestBodySize: 8 },
+    } as any)
+
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+
+    await proxy.start()
+    try {
+      const res = await httpRequest(port, {
+        method: 'POST',
+        path: '/upload',
+        headers: {
+          'content-length': String(Buffer.byteLength('larger-than-eight')),
+        },
+        body: 'larger-than-eight',
+      })
+      expect(res.status).toBe(413)
     } finally {
       await proxy.stop()
     }

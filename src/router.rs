@@ -1,4 +1,4 @@
-use crate::lb;
+use crate::{lb, options};
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -116,11 +116,18 @@ const MAX_AFFINITY_KEY_LEN: usize = 256;
 pub struct Router {
     config: ArcSwap<RouterConfig>,
     sticky: Option<Arc<StickySessionState>>,
+    limits: options::ProxyLimitsOptionsParsed,
+    timeouts: options::ProxyTimeoutOptionsParsed,
 }
 
 impl Router {
     #[allow(dead_code)]
-    pub fn new(config: RouterConfig, sticky_config: StickySessionConfig) -> Self {
+    pub fn new(
+        config: RouterConfig,
+        sticky_config: StickySessionConfig,
+        limits: options::ProxyLimitsOptionsParsed,
+        timeouts: options::ProxyTimeoutOptionsParsed,
+    ) -> Self {
         let sticky = if sticky_config.enabled {
             let mut shards = Vec::with_capacity(STICKY_SHARD_COUNT);
             for _ in 0..STICKY_SHARD_COUNT {
@@ -142,6 +149,8 @@ impl Router {
         Self {
             config: ArcSwap::from_pointee(config),
             sticky,
+            limits,
+            timeouts,
         }
     }
 
@@ -234,6 +243,8 @@ impl ProxyHttp for SharedRouter {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let config = self.0.config.load();
+        let limits = &self.0.limits;
+        let timeouts = &self.0.timeouts;
 
         // TODO(vNext): Deterministic downstream error mapping.
         // Today, a number of routing/upstream-selection failures bubble up as Pingora internal errors,
@@ -244,6 +255,12 @@ impl ProxyHttp for SharedRouter {
         // - no pools available for request type (e.g. upgrade requires http1)
         // - no healthy upstreams available
         // Acceptance: response status/body/headers are stable across versions and covered by tests.
+
+        if let Some(status) = request_limit_rejection_status(session, limits) {
+            return reject_request(session, status).await;
+        }
+
+        apply_downstream_timeouts(session, timeouts);
 
         let host = extract_host(session);
         let path_first_segment = extract_first_path_segment(session);
@@ -398,6 +415,7 @@ impl ProxyHttp for SharedRouter {
             resolved.secure,
             resolved.verify_hostname.clone(),
         );
+        apply_upstream_timeouts(&mut peer, &self.0.timeouts);
         // For plaintext HTTP/2 upstreams (h2c), Pingora needs the peer's min HTTP version to be 2,
         // otherwise it will assume HTTP/1.1 when no ALPN is present.
         if resolved.is_http2 {
@@ -744,6 +762,118 @@ fn extract_first_path_segment(session: &Session) -> Option<&str> {
     parts.next()
 }
 
+async fn reject_request(session: &mut Session, status: StatusCode) -> Result<bool> {
+    session.downstream_session.set_keepalive(None);
+    session.respond_error(status.as_u16()).await?;
+    Ok(true)
+}
+
+fn request_uri_size(session: &Session) -> usize {
+    let uri = &session.req_header().uri;
+    let mut size = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().len(), |pq| pq.as_str().len());
+
+    if let Some(scheme) = uri.scheme_str() {
+        size += scheme.len() + "://".len();
+    }
+
+    if let Some(authority) = uri.authority() {
+        size += authority.as_str().len();
+    }
+
+    size
+}
+
+fn request_header_count(session: &Session) -> usize {
+    session.req_header().headers.len()
+}
+
+fn request_single_header_size(session: &Session) -> usize {
+    session
+        .req_header()
+        .headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn request_header_size(session: &Session) -> usize {
+    session.downstream_session.to_h1_raw().len()
+}
+
+fn request_content_length(session: &Session) -> Option<u64> {
+    session
+        .req_header()
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn request_limit_rejection_status(
+    session: &Session,
+    limits: &options::ProxyLimitsOptionsParsed,
+) -> Option<StatusCode> {
+    let options::ProxyLimitsOptionsParsed::Enabled { checks } = limits else {
+        return None;
+    };
+
+    for check in checks {
+        match check {
+            options::ProxyLimitCheckParsed::UriBytes(limit) => {
+                if request_uri_size(session) > *limit {
+                    return Some(StatusCode::URI_TOO_LONG);
+                }
+            }
+            options::ProxyLimitCheckParsed::RequestHeaders(limit) => {
+                if request_header_count(session) > *limit {
+                    return Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+                }
+            }
+            options::ProxyLimitCheckParsed::SingleHeaderBytes(limit) => {
+                if request_single_header_size(session) > *limit {
+                    return Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+                }
+            }
+            options::ProxyLimitCheckParsed::RequestHeaderBytes(limit) => {
+                if request_header_size(session) > *limit {
+                    return Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+                }
+            }
+            options::ProxyLimitCheckParsed::RequestBodyBytes(limit) => {
+                if request_content_length(session).is_some_and(|n| n > *limit) {
+                    return Some(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn apply_downstream_timeouts(session: &mut Session, timeouts: &options::ProxyTimeoutOptionsParsed) {
+    session
+        .downstream_session
+        .set_read_timeout(Some(duration_ms(timeouts.downstream_body_idle_timeout_ms)));
+    session
+        .downstream_session
+        .set_keepalive(Some(timeouts.downstream_keep_alive_timeout_seconds as u64));
+}
+
+fn apply_upstream_timeouts(peer: &mut HttpPeer, timeouts: &options::ProxyTimeoutOptionsParsed) {
+    let upstream_connect = duration_ms(timeouts.upstream_connect_timeout_ms);
+    peer.options.connection_timeout = Some(upstream_connect);
+    peer.options.total_connection_timeout = Some(upstream_connect);
+    peer.options.read_timeout = Some(duration_ms(timeouts.upstream_read_timeout_ms));
+    peer.options.write_timeout = Some(duration_ms(timeouts.upstream_write_timeout_ms));
+}
+
+fn duration_ms(value: u32) -> Duration {
+    Duration::from_millis(value as u64)
+}
+
 fn extract_host(session: &Session) -> Option<Cow<'_, str>> {
     let headers = &session.req_header().headers;
 
@@ -957,9 +1087,12 @@ pub mod bench {
 mod tests {
     use super::{
         AffinityEntry, AffinityMapKey, StickySessionConfig, StickySessionState, StickyShard,
-        is_cookie_safe_affinity_key, resolve_route, strip_first_path_segment,
+        apply_upstream_timeouts, is_cookie_safe_affinity_key, resolve_route,
+        strip_first_path_segment,
     };
     use crate::lb::TransportKind;
+    use crate::options::ProxyTimeoutOptionsParsed;
+    use pingora::upstreams::peer::HttpPeer;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
@@ -994,6 +1127,38 @@ mod tests {
             transport: TransportKind::Http1,
             affinity_key: value.to_string(),
         }
+    }
+
+    #[test]
+    fn upstream_timeout_options_map_to_pingora_peer_options() {
+        let timeouts = ProxyTimeoutOptionsParsed {
+            downstream_header_timeout_ms: 10_000,
+            downstream_body_idle_timeout_ms: 60_000,
+            upstream_connect_timeout_ms: 1_234,
+            upstream_read_timeout_ms: 2_345,
+            upstream_write_timeout_ms: 3_456,
+            downstream_keep_alive_timeout_seconds: 75,
+        };
+        let mut peer = HttpPeer::new("127.0.0.1:8080", false, String::new());
+
+        apply_upstream_timeouts(&mut peer, &timeouts);
+
+        assert_eq!(
+            peer.options.connection_timeout,
+            Some(Duration::from_millis(1_234))
+        );
+        assert_eq!(
+            peer.options.total_connection_timeout,
+            Some(Duration::from_millis(1_234))
+        );
+        assert_eq!(
+            peer.options.read_timeout,
+            Some(Duration::from_millis(2_345))
+        );
+        assert_eq!(
+            peer.options.write_timeout,
+            Some(Duration::from_millis(3_456))
+        );
     }
 
     fn insert_entry(

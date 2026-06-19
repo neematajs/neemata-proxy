@@ -3,6 +3,21 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashSet;
 
+pub mod defaults {
+    pub const MAX_URI_BYTES: usize = 8_192;
+    pub const MAX_REQUEST_HEADERS: usize = 100;
+    pub const MAX_SINGLE_HEADER_BYTES: usize = 8_192;
+    pub const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+    pub const MAX_REQUEST_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+    pub const DOWNSTREAM_HEADER_TIMEOUT_MS: u32 = 10_000;
+    pub const DOWNSTREAM_BODY_IDLE_TIMEOUT_MS: u32 = 60_000;
+    pub const UPSTREAM_CONNECT_TIMEOUT_MS: u32 = 5_000;
+    pub const UPSTREAM_READ_TIMEOUT_MS: u32 = 60_000;
+    pub const UPSTREAM_WRITE_TIMEOUT_MS: u32 = 60_000;
+    pub const DOWNSTREAM_KEEP_ALIVE_TIMEOUT_SECONDS: u32 = 75;
+}
+
 #[napi(object)]
 pub struct ProxyOptions {
     pub listen: String,
@@ -12,6 +27,40 @@ pub struct ProxyOptions {
     pub health_check_interval_ms: Option<u32>,
     /// Sticky session configuration.
     pub sticky_sessions: Option<StickySessionOptions>,
+    /// Request size and header limits. All size values are bytes. Set null to disable all Neemata request limit checks.
+    pub limits: Option<Either<ProxyLimitsOptions, Null>>,
+    /// Downstream and upstream timeout configuration. Values are milliseconds except downstreamKeepAlive, which is seconds.
+    pub timeouts: Option<ProxyTimeoutOptions>,
+}
+
+#[napi(object)]
+pub struct ProxyLimitsOptions {
+    /// Maximum request URI size, in bytes (default: 8192 bytes / 8 KiB). Set null to disable this check.
+    pub max_uri_size: Option<Either<u32, Null>>,
+    /// Maximum request header count (default: 100). Set null to disable this check.
+    pub max_request_headers: Option<Either<u32, Null>>,
+    /// Maximum single request header size, in bytes (default: 8192 bytes / 8 KiB). Set null to disable this check.
+    pub max_single_header_size: Option<Either<u32, Null>>,
+    /// Maximum total request header size, in bytes (default: 65536 bytes / 64 KiB). Set null to disable this check.
+    pub max_request_header_size: Option<Either<u32, Null>>,
+    /// Maximum Content-Length accepted, in bytes (default: 16777216 bytes / 16 MiB). Set null to disable this check. Chunked or unknown-length body enforcement depends on future Pingora early body buffering support.
+    pub max_request_body_size: Option<Either<u32, Null>>,
+}
+
+#[napi(object)]
+pub struct ProxyTimeoutOptions {
+    /// Timeout for receiving downstream request headers, in milliseconds (default: 10000 ms / 10s). Parsed and validated, but not enforced until Pingora exposes a pre-header-read hook.
+    pub downstream_header: Option<u32>,
+    /// Idle timeout between downstream HTTP/1 request body chunks, in milliseconds (default: 60000 ms / 60s / 1min). Pingora currently no-ops this for downstream HTTP/2.
+    pub downstream_body_idle: Option<u32>,
+    /// Timeout for connecting to upstream, in milliseconds (default: 5000 ms / 5s).
+    pub upstream_connect: Option<u32>,
+    /// Idle timeout while reading upstream response data, in milliseconds (default: 60000 ms / 60s / 1min).
+    pub upstream_read: Option<u32>,
+    /// Idle timeout while writing request data upstream, in milliseconds (default: 60000 ms / 60s / 1min).
+    pub upstream_write: Option<u32>,
+    /// Downstream HTTP/1 keep-alive idle timeout, in seconds (default: 75 seconds / 1m15s). Pingora currently no-ops this for downstream HTTP/2.
+    pub downstream_keep_alive: Option<u32>,
 }
 
 #[napi(object)]
@@ -57,6 +106,8 @@ pub struct ProxyOptionsParsed {
     /// Health check interval in milliseconds.
     pub health_check_interval_ms: u32,
     pub sticky_sessions: StickySessionOptionsParsed,
+    pub limits: ProxyLimitsOptionsParsed,
+    pub timeouts: ProxyTimeoutOptionsParsed,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +117,32 @@ pub struct StickySessionOptionsParsed {
     pub header_name: String,
     pub ttl_ms: u32,
     pub max_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyLimitsOptionsParsed {
+    Disabled,
+    Enabled { checks: Vec<ProxyLimitCheckParsed> },
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyLimitCheckParsed {
+    UriBytes(usize),
+    RequestHeaders(usize),
+    SingleHeaderBytes(usize),
+    RequestHeaderBytes(usize),
+    RequestBodyBytes(u64),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyTimeoutOptionsParsed {
+    #[allow(dead_code)]
+    pub downstream_header_timeout_ms: u32,
+    pub downstream_body_idle_timeout_ms: u32,
+    pub upstream_connect_timeout_ms: u32,
+    pub upstream_read_timeout_ms: u32,
+    pub upstream_write_timeout_ms: u32,
+    pub downstream_keep_alive_timeout_seconds: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +183,8 @@ pub fn parse_proxy_options(env: &Env, options: ProxyOptions) -> Result<ProxyOpti
     validate_applications(env, &applications)?;
 
     let sticky_sessions = parse_sticky_session_options(env, options.sticky_sessions)?;
+    let limits = parse_limits_options(env, options.limits)?;
+    let timeouts = parse_timeout_options(env, options.timeouts)?;
 
     Ok(ProxyOptionsParsed {
         listen,
@@ -113,7 +192,195 @@ pub fn parse_proxy_options(env: &Env, options: ProxyOptions) -> Result<ProxyOpti
         applications,
         health_check_interval_ms: options.health_check_interval_ms.unwrap_or(5000),
         sticky_sessions,
+        limits,
+        timeouts,
     })
+}
+
+fn parse_limits_options(
+    env: &Env,
+    limits: Option<Either<ProxyLimitsOptions, Null>>,
+) -> Result<ProxyLimitsOptionsParsed> {
+    let Some(limits) = limits else {
+        return Ok(default_limit_checks());
+    };
+
+    let Either::A(limits) = limits else {
+        return Ok(ProxyLimitsOptionsParsed::Disabled);
+    };
+
+    let mut checks = Vec::with_capacity(5);
+
+    if let Some(limit) = parse_nullable_positive_usize(
+        env,
+        "limits.maxUriSize",
+        limits.max_uri_size,
+        defaults::MAX_URI_BYTES,
+    )? {
+        checks.push(ProxyLimitCheckParsed::UriBytes(limit));
+    }
+
+    if let Some(limit) = parse_nullable_positive_usize(
+        env,
+        "limits.maxRequestHeaders",
+        limits.max_request_headers,
+        defaults::MAX_REQUEST_HEADERS,
+    )? {
+        checks.push(ProxyLimitCheckParsed::RequestHeaders(limit));
+    }
+
+    if let Some(limit) = parse_nullable_positive_usize(
+        env,
+        "limits.maxSingleHeaderSize",
+        limits.max_single_header_size,
+        defaults::MAX_SINGLE_HEADER_BYTES,
+    )? {
+        checks.push(ProxyLimitCheckParsed::SingleHeaderBytes(limit));
+    }
+
+    if let Some(limit) = parse_nullable_positive_usize(
+        env,
+        "limits.maxRequestHeaderSize",
+        limits.max_request_header_size,
+        defaults::MAX_REQUEST_HEADER_BYTES,
+    )? {
+        checks.push(ProxyLimitCheckParsed::RequestHeaderBytes(limit));
+    }
+
+    if let Some(limit) = parse_nullable_positive_u64(
+        env,
+        "limits.maxRequestBodySize",
+        limits.max_request_body_size,
+        defaults::MAX_REQUEST_BODY_BYTES,
+    )? {
+        checks.push(ProxyLimitCheckParsed::RequestBodyBytes(limit));
+    }
+
+    Ok(if checks.is_empty() {
+        ProxyLimitsOptionsParsed::Disabled
+    } else {
+        ProxyLimitsOptionsParsed::Enabled { checks }
+    })
+}
+
+fn default_limit_checks() -> ProxyLimitsOptionsParsed {
+    ProxyLimitsOptionsParsed::Enabled {
+        checks: vec![
+            ProxyLimitCheckParsed::UriBytes(defaults::MAX_URI_BYTES),
+            ProxyLimitCheckParsed::RequestHeaders(defaults::MAX_REQUEST_HEADERS),
+            ProxyLimitCheckParsed::SingleHeaderBytes(defaults::MAX_SINGLE_HEADER_BYTES),
+            ProxyLimitCheckParsed::RequestHeaderBytes(defaults::MAX_REQUEST_HEADER_BYTES),
+            ProxyLimitCheckParsed::RequestBodyBytes(defaults::MAX_REQUEST_BODY_BYTES),
+        ],
+    }
+}
+
+fn parse_timeout_options(
+    env: &Env,
+    timeouts: Option<ProxyTimeoutOptions>,
+) -> Result<ProxyTimeoutOptionsParsed> {
+    let Some(timeouts) = timeouts else {
+        return Ok(ProxyTimeoutOptionsParsed {
+            downstream_header_timeout_ms: defaults::DOWNSTREAM_HEADER_TIMEOUT_MS,
+            downstream_body_idle_timeout_ms: defaults::DOWNSTREAM_BODY_IDLE_TIMEOUT_MS,
+            upstream_connect_timeout_ms: defaults::UPSTREAM_CONNECT_TIMEOUT_MS,
+            upstream_read_timeout_ms: defaults::UPSTREAM_READ_TIMEOUT_MS,
+            upstream_write_timeout_ms: defaults::UPSTREAM_WRITE_TIMEOUT_MS,
+            downstream_keep_alive_timeout_seconds: defaults::DOWNSTREAM_KEEP_ALIVE_TIMEOUT_SECONDS,
+        });
+    };
+
+    Ok(ProxyTimeoutOptionsParsed {
+        downstream_header_timeout_ms: parse_positive_u32(
+            env,
+            "timeouts.downstreamHeader",
+            timeouts.downstream_header,
+            defaults::DOWNSTREAM_HEADER_TIMEOUT_MS,
+        )?,
+        downstream_body_idle_timeout_ms: parse_positive_u32(
+            env,
+            "timeouts.downstreamBodyIdle",
+            timeouts.downstream_body_idle,
+            defaults::DOWNSTREAM_BODY_IDLE_TIMEOUT_MS,
+        )?,
+        upstream_connect_timeout_ms: parse_positive_u32(
+            env,
+            "timeouts.upstreamConnect",
+            timeouts.upstream_connect,
+            defaults::UPSTREAM_CONNECT_TIMEOUT_MS,
+        )?,
+        upstream_read_timeout_ms: parse_positive_u32(
+            env,
+            "timeouts.upstreamRead",
+            timeouts.upstream_read,
+            defaults::UPSTREAM_READ_TIMEOUT_MS,
+        )?,
+        upstream_write_timeout_ms: parse_positive_u32(
+            env,
+            "timeouts.upstreamWrite",
+            timeouts.upstream_write,
+            defaults::UPSTREAM_WRITE_TIMEOUT_MS,
+        )?,
+        downstream_keep_alive_timeout_seconds: parse_positive_u32(
+            env,
+            "timeouts.downstreamKeepAlive",
+            timeouts.downstream_keep_alive,
+            defaults::DOWNSTREAM_KEEP_ALIVE_TIMEOUT_SECONDS,
+        )?,
+    })
+}
+
+fn parse_nullable_positive_usize(
+    env: &Env,
+    field: &str,
+    value: Option<Either<u32, Null>>,
+    default: usize,
+) -> Result<Option<usize>> {
+    Ok(parse_nullable_positive_u32(env, field, value, default as u32)?.map(|value| value as usize))
+}
+
+fn parse_nullable_positive_u64(
+    env: &Env,
+    field: &str,
+    value: Option<Either<u32, Null>>,
+    default: u64,
+) -> Result<Option<u64>> {
+    Ok(parse_nullable_positive_u32(env, field, value, default as u32)?.map(|value| value as u64))
+}
+
+fn parse_nullable_positive_u32(
+    env: &Env,
+    field: &str,
+    value: Option<Either<u32, Null>>,
+    default: u32,
+) -> Result<Option<u32>> {
+    let value = match value {
+        Some(Either::A(value)) => value,
+        Some(Either::B(_)) => return Ok(None),
+        None => default,
+    };
+
+    if value == 0 {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_PROXY_OPTIONS,
+            format!("{field} must be greater than 0"),
+        );
+    }
+
+    Ok(Some(value))
+}
+
+fn parse_positive_u32(env: &Env, field: &str, value: Option<u32>, default: u32) -> Result<u32> {
+    let value = value.unwrap_or(default);
+    if value == 0 {
+        return errors::throw_type_error(
+            env,
+            errors::codes::INVALID_PROXY_OPTIONS,
+            format!("{field} must be greater than 0"),
+        );
+    }
+    Ok(value)
 }
 
 fn parse_sticky_session_options(
