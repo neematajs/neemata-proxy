@@ -156,6 +156,8 @@ impl Proxy {
                 max_entries: parsed.sticky_sessions.max_entries,
                 cookie_secure: parsed.tls.is_some(),
             },
+            parsed.limits.clone(),
+            parsed.timeouts.clone(),
         ));
 
         let mut upstreams_by_app = HashMap::new();

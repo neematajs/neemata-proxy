@@ -10,6 +10,35 @@ const subdomainRouting: ProxyApplicationRouting = {
 const defaultProxyOptions: ProxyOptions = {
   listen: '127.0.0.1:0',
   applications: [{ name: 'app', routing: defaultRouting }],
+  limits: {
+    maxUriSize: 8192,
+    maxRequestHeaders: 100,
+    maxSingleHeaderSize: 8192,
+    maxRequestHeaderSize: 64 * 1024,
+    maxRequestBodySize: 16 * 1024 * 1024,
+  },
+  timeouts: {
+    downstreamHeader: 10000,
+    downstreamBodyIdle: 60000,
+    upstreamConnect: 5000,
+    upstreamRead: 60000,
+    upstreamWrite: 60000,
+    downstreamKeepAlive: 75,
+  },
+}
+
+const proxyOptionsWithDisabledLimits: ProxyOptions = {
+  listen: '127.0.0.1:0',
+  applications: [{ name: 'app', routing: defaultRouting }],
+  limits: null,
+}
+
+const proxyOptionsWithDisabledUriLimit: ProxyOptions = {
+  listen: '127.0.0.1:0',
+  applications: [{ name: 'app', routing: defaultRouting }],
+  limits: {
+    maxUriSize: null,
+  },
 }
 
 const defaultRoutingWithName: ProxyApplicationRouting = {
