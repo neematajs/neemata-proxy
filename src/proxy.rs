@@ -11,7 +11,6 @@ use std::os::unix::io::IntoRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, watch};
-use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -279,9 +278,6 @@ impl Proxy {
                 }
             };
 
-            let cancel = CancellationToken::new();
-            let cancel_child = cancel.clone();
-
             // Start LB health tasks first so pools become ready.
             for (svc_name, lb) in initial_lb_tasks {
                 server
@@ -301,7 +297,7 @@ impl Proxy {
             fds.add(listen.clone(), fd);
 
             #[cfg(unix)]
-            let listen_fds: pingora::server::ListenFds = Arc::new(TokioMutex::new(fds));
+            let listen_fds: pingora::server::ListenFds = Arc::new(fds.into());
 
             let conf = Arc::new(pingora::server::configuration::ServerConf::default());
             let mut svc = pingora::proxy::http_proxy_service_with_name(
@@ -315,37 +311,27 @@ impl Proxy {
                 svc.add_tcp(&listen);
             }
 
+            let (shutdown, shutdown_rx) = watch::channel(false);
             let task = tokio::spawn(async move {
-                let (shutdown_tx, shutdown_rx) = watch::channel(false);
-                let mut service_fut = Box::pin(async move {
-                    use pingora::services::Service as _;
-                    #[cfg(unix)]
-                    svc.start_service(Some(listen_fds), shutdown_rx, conf.listener_tasks_per_fd)
+                use pingora::services::Service as _;
+                #[cfg(unix)]
+                svc.start_service(Some(listen_fds), shutdown_rx, conf.listener_tasks_per_fd)
+                    .await;
+
+                #[cfg(windows)]
+                {
+                    // Windows artifacts are not currently published. This fallback lets
+                    // Pingora bind from `listen`, so `listen: ...:0` is not guaranteed to
+                    // match `listen_address`; ephemeral-port reporting is supported on Unix.
+                    svc.start_service(shutdown_rx, conf.listener_tasks_per_fd)
                         .await;
-
-                    #[cfg(windows)]
-                    {
-                        // Windows artifacts are not currently published. This fallback lets
-                        // Pingora bind from `listen`, so `listen: ...:0` is not guaranteed to
-                        // match `listen_address`; ephemeral-port reporting is supported on Unix.
-                        svc.start_service(shutdown_rx, conf.listener_tasks_per_fd)
-                            .await;
-                    }
-                });
-
-                tokio::select! {
-                    _ = &mut service_fut => {}
-                    _ = cancel_child.cancelled() => {
-                        let _ = shutdown_tx.send(true);
-                        let _ = service_fut.await;
-                    }
                 }
             });
 
             server
                 .upsert_service(
                     "main_http".to_string(),
-                    server::ServiceHandle { cancel, task },
+                    server::ServiceHandle { shutdown, task },
                 )
                 .await;
 
