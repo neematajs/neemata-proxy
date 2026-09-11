@@ -1,7 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::{sync::Mutex, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
+use tokio::{
+    sync::{Mutex, watch},
+    task::JoinHandle,
+};
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -11,7 +13,7 @@ pub struct Server {
 
 #[allow(dead_code)]
 pub struct ServiceHandle {
-    pub cancel: CancellationToken,
+    pub shutdown: watch::Sender<bool>,
     pub task: JoinHandle<()>,
 }
 
@@ -49,7 +51,7 @@ impl Server {
         };
 
         if let Some(old) = old {
-            old.cancel.cancel();
+            let _ = old.shutdown.send(true);
             let _ = old.task.await;
         }
     }
@@ -61,7 +63,7 @@ impl Server {
         };
 
         if let Some(old) = old {
-            old.cancel.cancel();
+            let _ = old.shutdown.send(true);
             let _ = old.task.await;
         }
     }
@@ -73,7 +75,7 @@ impl Server {
         };
 
         for (_, handle) in services {
-            handle.cancel.cancel();
+            let _ = handle.shutdown.send(true);
             let _ = handle.task.await;
         }
     }

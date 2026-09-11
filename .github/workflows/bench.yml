@@ -34,10 +34,5 @@ jobs:
             ./target
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Patch crate
-        run: |
-          cargo install patch-crate
-          cargo patch-crate
-
       - name: Run router benchmarks
         run: cargo bench --bench router -- --noplot

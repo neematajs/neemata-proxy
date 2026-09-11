@@ -14,7 +14,6 @@ use http::{StatusCode, Uri};
 use pingora::http::RequestHeader;
 use pingora::http::ResponseHeader;
 use pingora::lb::{LoadBalancer, selection::RoundRobin};
-use pingora::modules::http::HttpModules;
 use pingora::proxy::{FailToProxy, ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
@@ -232,13 +231,6 @@ impl ProxyHttp for SharedRouter {
 
     fn new_ctx(&self) -> Self::CTX {
         RouterCtx::default()
-    }
-
-    fn init_downstream_modules(&self, modules: &mut HttpModules) {
-        // Keep Pingora's default behavior (disabled compression) explicit here so we
-        // have a clear extension point for adding static downstream modules later.
-        modules
-            .add_module(pingora::modules::http::compression::ResponseCompressionBuilder::enable(0));
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -768,23 +760,6 @@ async fn reject_request(session: &mut Session, status: StatusCode) -> Result<boo
     Ok(true)
 }
 
-fn request_uri_size(session: &Session) -> usize {
-    let uri = &session.req_header().uri;
-    let mut size = uri
-        .path_and_query()
-        .map_or_else(|| uri.path().len(), |pq| pq.as_str().len());
-
-    if let Some(scheme) = uri.scheme_str() {
-        size += scheme.len() + "://".len();
-    }
-
-    if let Some(authority) = uri.authority() {
-        size += authority.as_str().len();
-    }
-
-    size
-}
-
 fn request_header_count(session: &Session) -> usize {
     session.req_header().headers.len()
 }
@@ -823,7 +798,7 @@ fn request_limit_rejection_status(
     for check in checks {
         match check {
             options::ProxyLimitCheckParsed::UriBytes(limit) => {
-                if request_uri_size(session) > *limit {
+                if session.req_header().raw_path().len() > *limit {
                     return Some(StatusCode::URI_TOO_LONG);
                 }
             }

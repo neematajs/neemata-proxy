@@ -245,6 +245,58 @@ describe('Proxy wiring', () => {
     }
   })
 
+  it('strips hop-by-hop and Connection-nominated headers upstream', async () => {
+    const upstreamPort = await getFreePort()
+    let received: http.IncomingHttpHeaders | undefined
+    const upstream = http.createServer((req, res) => {
+      received = req.headers
+      res.end('ok')
+    })
+    const closeSockets = trackConnections(upstream)
+    await new Promise<void>((resolve) =>
+      upstream.listen(upstreamPort, '127.0.0.1', resolve),
+    )
+    toClose.push(async () => {
+      closeSockets()
+      await new Promise<void>((resolve) => upstream.close(() => resolve()))
+    })
+
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+    })
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamPort,
+    })
+    await proxy.start()
+    try {
+      const res = await waitFor(
+        () =>
+          httpGet(port, '/', {
+            connection: 'keep-alive, x-remove',
+            'x-remove': 'private',
+            'keep-alive': 'timeout=5',
+            'proxy-connection': 'keep-alive',
+            'x-forward': 'retained',
+          }),
+        (res) => res.status === 200,
+      )
+      expect(res.body).toBe('ok')
+      expect(received?.['x-forward']).toBe('retained')
+      expect(received?.connection).toBeUndefined()
+      expect(received?.['x-remove']).toBeUndefined()
+      expect(received?.['keep-alive']).toBeUndefined()
+      expect(received?.['proxy-connection']).toBeUndefined()
+    } finally {
+      await proxy.stop()
+    }
+  })
+
   it('exposes the bound listener address while running', async () => {
     const ephemeralProxy = new NeemataProxy({
       listen: '127.0.0.1:0',
@@ -464,6 +516,35 @@ describe('Proxy wiring', () => {
       }
     },
   )
+
+  it('stops promptly between long health-check intervals', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      healthCheckIntervalMs: 60_000,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+    })
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+    await proxy.start()
+    try {
+      await waitFor(
+        () => httpGet(port, '/hello'),
+        (res) => res.status === 200,
+      )
+    } finally {
+      const started = Date.now()
+      await proxy.stop()
+      expect(Date.now() - started).toBeLessThan(2000)
+    }
+    expect(proxy.address()).toBeNull()
+    await expect(httpGet(port, '/hello')).rejects.toThrow()
+  })
 
   it('actually releases the listener port after stop()', async () => {
     const port = await getFreePort()
@@ -825,6 +906,37 @@ describe('Proxy wiring', () => {
     try {
       const res = await httpGet(port, `/${'a'.repeat(64)}`)
       expect(res.status).toBe(414)
+    } finally {
+      await proxy.stop()
+    }
+  })
+
+  it('counts the full absolute-form request target toward maxUriSize', async () => {
+    const port = await getFreePort()
+    const proxy = new NeemataProxy({
+      listen: `127.0.0.1:${port}`,
+      applications: [{ name: 'app', routing: { type: 'default' } }],
+      limits: { maxUriSize: 48 },
+    })
+    await proxy.addUpstream('app', {
+      type: 'port',
+      transport: 'http',
+      secure: false,
+      hostname: '127.0.0.1',
+      port: upstreamHttp1Port,
+    })
+    await proxy.start()
+    try {
+      const target = 'http://example.com/hello'
+      const res = await waitFor(
+        () => httpGet(port, target, { host: 'example.com' }),
+        (res) => res.status === 200,
+      )
+      expect(res.body).toBe(`h1:${target}`)
+
+      const host = `${'a'.repeat(40)}.example.com`
+      const oversized = await httpGet(port, `http://${host}/hello`, { host })
+      expect(oversized.status).toBe(414)
     } finally {
       await proxy.stop()
     }
