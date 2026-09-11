@@ -288,6 +288,7 @@ describe('Proxy wiring', () => {
       )
       expect(res.body).toBe('ok')
       expect(received?.['x-forward']).toBe('retained')
+      expect(received?.connection).toBeUndefined()
       expect(received?.['x-remove']).toBeUndefined()
       expect(received?.['keep-alive']).toBeUndefined()
       expect(received?.['proxy-connection']).toBeUndefined()
